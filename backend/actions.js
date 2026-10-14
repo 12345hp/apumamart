@@ -15,6 +15,46 @@ const bcrypt = require('bcryptjs');
 const { getPool, isReady } = require('../db');
 const { normMobile, pubUser, num } = require('../util');
 
+
+// ---------------------------------------------------------------------------
+// Sentry backend error monitoring (zero-dependency, uses built-in https)
+// ---------------------------------------------------------------------------
+const SENTRY_DSN = 'https://1242c863a8cde973ec79cf6d9e0aa4ba@o4512254073831424.ingest.us.sentry.io/4512254115250176';
+function captureErr(err, ctx) {
+  try {
+    if (!err) return;
+    const m = SENTRY_DSN.match(/https:\/\/([^@]+)@([^\/]+)\/(\d+)/);
+    if (!m) return;
+    const [, key, host, pid] = m;
+    const body = JSON.stringify({
+      event_id: require('crypto').randomBytes(16).toString('hex'),
+      timestamp: new Date().toISOString().slice(0, 19),
+      platform: 'node',
+      level: 'error',
+      exception: { values: [{ type: err.name || 'Error', value: String(err.message || err).slice(0, 2000) }] },
+      extra: ctx || {},
+    });
+    const header = JSON.stringify({ event_id: JSON.parse(body).event_id, sent_at: new Date().toISOString() });
+    const payload = header + '\n{"type":"event","length":' + Buffer.byteLength(body) + '}\n' + body;
+    const req = require('https').request({
+      hostname: host, port: 443, path: `/api/${pid}/envelope/`,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-sentry-envelope',
+        'X-Sentry-Auth': `Sentry sentry_version=7,sentry_key=${key},sentry_client=apumamart-backend/1.0`,
+        'Content-Length': Buffer.byteLength(payload),
+      },
+      timeout: 5000,
+    });
+    req.on('error', () => {});
+    req.on('timeout', () => req.destroy());
+    req.end(payload);
+  } catch (_) {}
+}
+process.on('uncaughtException', (e) => { captureErr(e, { where: 'uncaughtException' }); });
+process.on('unhandledRejection', (e) => { captureErr(e, { where: 'unhandledRejection' }); });
+console.log('[Sentry] Backend error monitoring active (zero-dependency)');
+
 const router = express.Router();
 
 // ---------------------------------------------------------------------------
