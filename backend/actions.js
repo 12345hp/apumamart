@@ -58,6 +58,37 @@ console.log('[Sentry] Backend error monitoring active (zero-dependency)');
 const router = express.Router();
 
 // ---------------------------------------------------------------------------
+// Health check: GET /health — checks DB connectivity. Use in UptimeRobot.
+// Returns 200 {ok:true} when healthy, 503 when DB down.
+// ---------------------------------------------------------------------------
+router.get('/health', async (req, res) => {
+  try {
+    const pool = getPool();
+    await pool.execute('SELECT 1').then(() => {});
+    return res.json({ ok: true, ts: new Date().toISOString() });
+  } catch (e) {
+    captureErr(e, { where: 'health-check' });
+    return res.status(503).json({ ok: false, error: 'db down' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Request timeout: kill requests taking >25s (prevents hanging workers).
+// ---------------------------------------------------------------------------
+router.use((req, res, next) => {
+  const t = setTimeout(() => {
+    if (!res.headersSent) {
+      captureErr(new Error('request timeout'), { path: req.path });
+      res.status(504).json({ error: 'request timeout' });
+    }
+  }, 25000);
+  res.on('finish', () => clearTimeout(t));
+  res.on('close', () => clearTimeout(t));
+  next();
+});
+
+
+// ---------------------------------------------------------------------------
 // Rate limiting: max 100 requests/minute per IP (zero-dependency).
 // Protects against abuse/accidental loops. Webhook + health are exempt.
 // ---------------------------------------------------------------------------
