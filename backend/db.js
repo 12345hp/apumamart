@@ -311,6 +311,7 @@ const SCHEMA = [
   manager_mobile VARCHAR(20) NULL,
   access_token CHAR(64) NOT NULL UNIQUE,
   token_active TINYINT(1) NOT NULL DEFAULT 1,
+  branch_user_id INT NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   INDEX idx_branches_owner (owner_user_id),
@@ -438,6 +439,11 @@ async function initDb() {
     const c = await pool.getConnection();
     try { await c.ping(); } finally { c.release(); }
     for (const sql of SCHEMA) await pool.execute(sql);
+    // V8 migration: branch_user_id for branch staff auto-login
+    try {
+      const [cols] = await pool.execute("SHOW COLUMNS FROM branches LIKE 'branch_user_id'");
+      if (!cols.length) await pool.execute("ALTER TABLE branches ADD COLUMN branch_user_id INT NULL");
+    } catch (_) {}
     await ensureBillColumns(pool);
     // One-time migration: normalize stored mobile numbers (strip leading 0 / 91)
     try {

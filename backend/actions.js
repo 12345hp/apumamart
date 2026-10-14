@@ -1289,15 +1289,28 @@ async function hCreateBranch(req, args) {
   const name = String(args.name || '').trim();
   if (!name) throw Object.assign(new Error('Branch name required'), { status: 400 });
   const token = genBranchToken();
+  const mgrMobile = String(args.manager_mobile || '').trim() || null;
+  const mgrName = String(args.manager_name || '').trim() || (name + ' Manager');
+  // V8: Create dedicated user account for this branch (manager auto-login).
+  // Data isolation via user_id which all APIs already enforce.
+  let branchUserId = null;
+  try {
+    const loginMobile = mgrMobile || ('br' + Date.now().toString(36));
+    const [ur] = await pool.execute(
+      "INSERT INTO users (name, mobile, role, business_name) VALUES (?, ?, 'staff', ?)",
+      [mgrName, loginMobile, name]
+    );
+    branchUserId = ur.insertId;
+  } catch (e) {
+    console.error('[createBranch] branch user failed:', e.message);
+  }
   const [r] = await pool.execute(
-    `INSERT INTO branches (owner_user_id, name, address, phone, manager_name, manager_mobile, access_token, token_active)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
+    `INSERT INTO branches (owner_user_id, name, address, phone, manager_name, manager_mobile, access_token, token_active, branch_user_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)`,
     [user.id, name,
      String(args.address || '').trim() || null,
      String(args.phone || '').trim() || null,
-     String(args.manager_name || '').trim() || null,
-     String(args.manager_mobile || '').trim() || null,
-     token]
+     mgrName, mgrMobile, token, branchUserId]
   );
   return { ok: true, branch_id: r.insertId, access_token: token,
            manager_link: '/branch.html?token=' + token };
@@ -1366,7 +1379,7 @@ async function hGetBranchByToken(req, args) {
     throw Object.assign(new Error('Invalid link'), { status: 400 });
   const [rows] = await pool.execute(
     `SELECT b.id, b.name, b.address, b.phone, b.manager_name, b.manager_mobile,
-            u.business_name AS owner_business
+            b.branch_user_id, u.business_name AS owner_business
      FROM branches b JOIN users u ON u.id = b.owner_user_id
      WHERE b.access_token = ? AND b.token_active = 1`,
     [token]
@@ -1374,8 +1387,21 @@ async function hGetBranchByToken(req, args) {
   if (!rows.length)
     throw Object.assign(new Error('This link is expired or invalid. Ask the owner for a new link.'), { status: 403 });
   const b = rows[0];
+  // V8: Auto-login session for branch user -> manager gets FULL app locked to branch.
+  let bst = null;
+  if (b.branch_user_id) {
+    try {
+      bst = crypto.randomBytes(32).toString('hex');
+      const exp = new Date(Date.now() + 365*24*3600*1000);
+      await pool.execute(
+        "INSERT INTO sessions (user_id, token_hash, expires_at) VALUES (?, ?, ?)",
+        [b.branch_user_id, crypto.createHash('sha256').update(bst).digest('hex'), exp]
+      );
+    } catch (e) { console.error('[branchToken] session failed:', e.message); bst = null; }
+  }
   return { ok: true, branch: { id: b.id, name: b.name, address: b.address,
-    phone: b.phone, manager_name: b.manager_name, owner_business: b.owner_business } };
+    phone: b.phone, manager_name: b.manager_name, owner_business: b.owner_business },
+    session_token: bst, branch_user_id: b.branch_user_id || null };
 }
 
 async function hListPosAdvance(req, args) {
@@ -1501,6 +1527,42 @@ async function hBranchCollections(req, args) {
       collection: total, period: period, start_date: startDate, end_date: endDate });
   }
   return { ok: true, branches: out, grand: grand, period: period, start_date: startDate, end_date: endDate };
+}
+
+// V8: Owner sees LIVE hisab of every branch + grand total.
+// Each branch has its own user account (branch_user_id); bills live under it.
+async function hGetAllBranchesHisab(req, args) {
+  const { user } = needAuth(await authUser(req));
+  const pool = getPool();
+  const [branches] = await pool.execute(
+    'SELECT id, name, manager_name, branch_user_id FROM branches WHERE owner_user_id = ? ORDER BY name',
+    [user.id]
+  ).catch(() => [[]]);
+  const out = [];
+  let gSales = 0, gBills = 0, gPaid = 0, gDue = 0;
+  for (const b of branches) {
+    let sales = 0, bills = 0, paid = 0, due = 0;
+    if (b.branch_user_id) {
+      try {
+        const [r] = await pool.execute(
+          `SELECT COUNT(*) AS cnt, COALESCE(SUM(total),0) AS sales,
+                  COALESCE(SUM(joma),0) AS paid,
+                  COALESCE(SUM(total - joma),0) AS due
+           FROM bills WHERE user_id = ?`,
+          [b.branch_user_id]
+        );
+        bills = r[0].cnt || 0;
+        sales = parseFloat(r[0].sales) || 0;
+        paid = parseFloat(r[0].paid) || 0;
+        due = parseFloat(r[0].due) || 0;
+      } catch (_) {}
+    }
+    gSales += sales; gBills += bills; gPaid += paid; gDue += due;
+    out.push({ id: b.id, name: b.name, manager_name: b.manager_name,
+      bills: bills, sales: sales, paid: paid, due: due });
+  }
+  return { ok: true, branches: out,
+    grand: { bills: gBills, sales: gSales, paid: gPaid, due: gDue } };
 }
 
 async function hListPosSales(req, args) {
@@ -2101,6 +2163,7 @@ const DIRECT = {
   updateBranchManager: hUpdateBranchManager,
   deleteBranch: hDeleteBranch,
   getBranchByToken: hGetBranchByToken,
+  getAllBranchesHisab: hGetAllBranchesHisab,
   listPosAdvance: hListPosAdvance,
   addPosAdvance: hAddPosAdvance,
   markPosAttendance: hMarkPosAttendance,
