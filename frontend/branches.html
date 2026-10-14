@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Branches - ApumaMart</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:sans-serif;background:#f5f5f5;padding:16px;max-width:700px;margin:0 auto}
+h2{color:#1565C0;margin:8px 0 16px}
+.card{background:#fff;border-radius:12px;padding:16px;margin-bottom:12px;box-shadow:0 2px 6px rgba(0,0,0,.08)}
+.row{display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap}
+.field{flex:1;min-width:140px}
+label{display:block;font-size:12px;color:#666;margin-bottom:4px;font-weight:600}
+input{width:100%;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:15px}
+button{padding:12px 18px;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;color:#fff}
+.btn-add{background:linear-gradient(135deg,#2e7d32,#43a047);width:100%}
+.btn-copy{background:#1565C0;font-size:13px;padding:8px 14px}
+.btn-change{background:#FF9800;font-size:13px;padding:8px 14px}
+.btn-del{background:#c62828;font-size:13px;padding:8px 14px}
+.branch-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.branch-head b{font-size:17px;color:#222}
+.mgr{font-size:14px;color:#555;margin:4px 0}
+.mgr b{color:#222}
+.link-box{background:#e8f5e9;border:1px dashed #2e7d32;border-radius:8px;padding:10px;margin:8px 0;font-size:13px;word-break:break-all;color:#1b5e20}
+.actions{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+.badge{display:inline-block;font-size:11px;padding:3px 10px;border-radius:20px;font-weight:700}
+.badge.on{background:#e8f5e9;color:#2e7d32}
+.badge.off{background:#ffebee;color:#c62828}
+#msg{padding:12px;border-radius:8px;margin-bottom:12px;display:none;font-size:14px}
+#msg.ok{display:block;background:#e8f5e9;color:#1b5e20}
+#msg.err{display:block;background:#ffebee;color:#c62828}
+.back{display:inline-block;margin-bottom:12px;color:#1565C0;text-decoration:none;font-weight:700}
+.form-toggle{margin-bottom:12px}
+#formCard{display:none}
+</style>
+</head>
+<body>
+<a class="back" href="/">← Back</a>
+<h2>🏪 Multi Branch Manager</h2>
+<div id="msg"></div>
+
+<div class="form-toggle">
+  <button class="btn-add" onclick="toggleForm()">+ New Branch</button>
+</div>
+
+<div class="card" id="formCard">
+  <h3 style="margin-bottom:12px">New Branch</h3>
+  <div class="row">
+    <div class="field"><label>Branch Name *</label><input id="bName" placeholder="e.g. Main Market Branch"></div>
+  </div>
+  <div class="row">
+    <div class="field"><label>Address</label><input id="bAddr" placeholder="Branch address"></div>
+  </div>
+  <div class="row">
+    <div class="field"><label>Phone</label><input id="bPhone" placeholder="Branch phone" inputmode="tel"></div>
+  </div>
+  <div class="row">
+    <div class="field"><label>Manager Name</label><input id="bMgrName" placeholder="Manager name"></div>
+    <div class="field"><label>Manager Mobile</label><input id="bMgrMobile" placeholder="Manager mobile" inputmode="tel"></div>
+  </div>
+  <button class="btn-add" onclick="createBranch()">Create Branch + Generate Link</button>
+</div>
+
+<div id="list"></div>
+
+<script>
+var API = 'https://api.apumamart.com/api/actions';
+function token(){
+  var keys = ['am_branch_token','am_token','token','auth_token','session_token','authToken','jwt','access_token'];
+  for (var i = 0; i < keys.length; i++){
+    try {
+      var v = localStorage.getItem(keys[i]) || sessionStorage.getItem(keys[i]);
+      if (v) return v;
+    } catch(e){}
+  }
+  try {
+    for (var j = 0; j < localStorage.length; j++){
+      var k = localStorage.key(j);
+      var val = localStorage.getItem(k);
+      if (val && val.length > 20 && /^[a-zA-Z0-9\-_]+$/.test(val)) return val;
+    }
+  } catch(e){}
+  return '';
+}
+function showMsg(t, ok){
+  var m = document.getElementById('msg');
+  m.textContent = t; m.className = ok ? 'ok' : 'err';
+  setTimeout(function(){ m.className=''; }, 4000);
+}
+function toggleForm(){
+  var f = document.getElementById('formCard');
+  f.style.display = f.style.display === 'none' ? 'block' : 'none';
+}
+async function api(action, args){
+  args = args || {};
+  var r = await fetch(API, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token() },
+    body: JSON.stringify({ action: action, args: args })
+  });
+  return r.json();
+}
+async function load(){
+  var t = token();
+  if (!t){
+    document.getElementById('list').innerHTML =
+      '<div class="card" style="text-align:center;padding:30px">' +
+      '<h3 style="margin-bottom:15px">🏪 Owner Login</h3>' +
+      '<input id="lm" type="tel" placeholder="Mobile Number" style="width:100%;padding:12px;margin-bottom:10px;border:1px solid #ddd;border-radius:10px;font-size:16px;box-sizing:border-box">' +
+      '<input id="lp" type="password" placeholder="Password" style="width:100%;padding:12px;margin-bottom:15px;border:1px solid #ddd;border-radius:10px;font-size:16px;box-sizing:border-box">' +
+      '<button onclick="doLogin()" style="width:100%;background:#1565C0;color:#fff;padding:13px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer">Login</button>' +
+      '<p id="lerr" style="color:#c62828;margin-top:10px;font-size:14px"></p>' +
+      '</div>';
+    return;
+  }
+  // V7 SECURITY: Check Branch plan subscription
+  try {
+    var sub = await api('getMySubscription');
+    var plan = (sub && sub.plan) ? sub.plan.toLowerCase() : '';
+    var hasBranchPlan = plan.indexOf('branch') !== -1;
+    // Owner bypass: allow if isOwner flag
+    var isOwner = sub && sub.isOwner;
+    if (!hasBranchPlan && !isOwner) {
+      document.getElementById('list').innerHTML =
+        '<div class="card" style="text-align:center;padding:30px;max-width:400px;margin:0 auto">' +
+        '<h3>🔒 Branch Plan Required</h3>' +
+        '<p style="margin:15px 0">Multi Branch ke liye Branch plan chahiye (₹699/month ya ₹4,999/year)</p>' +
+        '<button onclick="window.location.href='/premium-plans.html'" style="background:#FF9800;color:#fff;padding:13px 30px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer">View Plans</button>' +
+        '</div>';
+      return;
+    }
+  } catch(e){ /* if check fails, allow - backend enforces too */ }
+  var d = await api('listBranches');
+  var box = document.getElementById('list');
+  if (!d.ok){
+    var err = d.error || 'failed';
+    // If token is invalid, clear bad tokens and show login form
+    if (/invalid token|missing bearer|unauthorized|expired/i.test(err)){
+      try {
+        localStorage.removeItem('am_branch_token');
+        localStorage.removeItem('am_token');
+        sessionStorage.removeItem('am_branch_token');
+      } catch(e){}
+      // Show login form
+      box.innerHTML =
+        '<div class="card" style="text-align:center;padding:30px;max-width:340px;margin:0 auto">' +
+        '<h3 style="margin-bottom:15px">🏪 Owner Login</h3>' +
+        '<input id="lm" type="tel" placeholder="Mobile Number" style="width:100%;padding:12px;margin-bottom:10px;border:1px solid #ddd;border-radius:10px;font-size:16px;box-sizing:border-box">' +
+        '<input id="lp" type="password" placeholder="Password" style="width:100%;padding:12px;margin-bottom:15px;border:1px solid #ddd;border-radius:10px;font-size:16px;box-sizing:border-box">' +
+        '<button onclick="doLogin()" style="width:100%;background:#1565C0;color:#fff;padding:13px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer">Login</button>' +
+        '<p id="lerr" style="color:#c62828;margin-top:10px;font-size:14px"></p>' +
+        '</div>';
+      return;
+    }
+    box.innerHTML = '<div class="card">Error: ' + esc(err) + '</div>'; return;
+  }
+  if (!d.branches.length){
+    box.innerHTML = '<div class="card" style="text-align:center;color:#888">No branches yet.<br>Tap "+ New Branch" to add one.</div>';
+    return;
+  }
+  var h = '';
+  d.branches.forEach(function(b){
+    h += '<div class="card">' +
+      '<div class="branch-head"><b>🏪 ' + esc(b.name) + '</b>' +
+      '<span class="badge ' + (b.token_active?'on':'off') + '">' + (b.token_active?'ACTIVE':'INACTIVE') + '</span></div>' +
+      (b.address ? '<div class="mgr">📍 ' + esc(b.address) + '</div>' : '') +
+      (b.phone ? '<div class="mgr">📞 ' + esc(b.phone) + '</div>' : '') +
+      '<div class="mgr">👨‍💼 Manager: <b>' + esc(b.manager_name||'-') + '</b> (' + esc(b.manager_mobile||'-') + ')</div>' +
+      (b.manager_link
+        ? '<div class="link-box">🔗 Manager link:<br><b>' + location.origin + esc(b.manager_link) + '</b></div>'
+        : '<div class="link-box" style="background:#ffebee;border-color:#c62828;color:#c62828">Link inactive</div>') +
+      '<div class="actions">' +
+        (b.manager_link ? '<button class="btn-copy" onclick="copyLink(\'' + b.manager_link + '\')">📋 Copy Link</button>' : '') +
+        '<button class="btn-change" onclick="changeManager(' + b.id + ', \'' + esc(b.manager_name||'') + '\', \'' + esc(b.manager_mobile||'') + '\')">🔄 Change Manager</button>' +
+        '<button class="btn-del" onclick="delBranch(' + b.id + ', \'' + esc(b.name) + '\')">🗑 Delete</button>' +
+      '</div></div>';
+  });
+  box.innerHTML = h;
+}
+function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+async function doLogin(){
+  var m = document.getElementById('lm').value.trim();
+  var p = document.getElementById('lp').value;
+  var e = document.getElementById('lerr');
+  if (!m || !p){ e.textContent = 'Number aur password dalo!'; return; }
+  e.textContent = 'Login ho raha hai...';
+  try {
+    var r = await fetch(API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'login', args: { mobile: m, password: p } })
+    });
+    var d = await r.json();
+    var tok = d && d.account && d.account.session_token;
+    if (tok){
+      try { localStorage.setItem('am_branch_token', tok); } catch(e2){}
+      load();
+    } else {
+      e.textContent = d.error || 'Login fail! Number/password check karo.';
+    }
+  } catch(err){
+    e.textContent = 'Network error! Phir try karo.';
+  }
+}
+async function createBranch(){
+  var name = document.getElementById('bName').value.trim();
+  if (!name){ showMsg('Branch name likho!', false); return; }
+  var d = await api('createBranch', {
+    name: name,
+    address: document.getElementById('bAddr').value.trim(),
+    phone: document.getElementById('bPhone').value.trim(),
+    manager_name: document.getElementById('bMgrName').value.trim(),
+    manager_mobile: document.getElementById('bMgrMobile').value.trim()
+  });
+  if (d.ok){
+    showMsg('✅ Branch ban gaya! Link copy karke manager ko bhejo.', true);
+    ['bName','bAddr','bPhone','bMgrName','bMgrMobile'].forEach(function(id){ document.getElementById(id).value=''; });
+    toggleForm(); load();
+  } else showMsg('Error: ' + (d.error||'failed'), false);
+}
+function copyLink(path){
+  var url = location.origin + path;
+  if (navigator.clipboard) navigator.clipboard.writeText(url).then(function(){
+    showMsg('📋 Link copied! WhatsApp par manager ko bhejo.', true);
+  });
+  else { prompt('Link copy karo:', url); }
+}
+async function changeManager(id, oldName, oldMobile){
+  var nm = prompt('Naya manager naam:', oldName || '');
+  if (nm === null) return;
+  var np = prompt('Naya manager mobile:', oldMobile || '');
+  if (np === null) return;
+  if (!confirm('⚠️ Purane manager (' + (oldName||'-') + ') ka link HAMESHA ke liye band ho jayega!\nNaya link banega. Continue?')) return;
+  var d = await api('updateBranchManager', { branch_id: id, manager_name: nm.trim(), manager_mobile: np.trim() });
+  if (d.ok){
+    showMsg('✅ Manager change ho gaya! Purana link DEAD. Naya link copy karke naye manager ko bhejo.', true);
+    load();
+  } else showMsg('Error: ' + (d.error||'failed'), false);
+}
+async function delBranch(id, name){
+  if (!confirm('"' + name + '" branch DELETE karein?\nManager ka link bhi band ho jayega!')) return;
+  var d = await api('deleteBranch', { branch_id: id });
+  if (d.ok){ showMsg('🗑 Branch deleted.', true); load(); }
+  else showMsg('Error: ' + (d.error||'failed'), false);
+}
+load();
+</script>
+</body>
+</html>
