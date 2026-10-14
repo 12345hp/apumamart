@@ -54,12 +54,10 @@ input:focus{border-color:#1565C0}
   <div class="login-card">
     <h1>🏪 ApumaMart</h1>
     <p>V2 — Naya System</p>
-    <input id="phone" type="tel" placeholder="Mobile Number (10 digit)" maxlength="10">
-    <button id="otpBtn" onclick="sendOTP()">OTP Bhejo</button>
-    <div id="otpSection" class="hidden">
-      <input id="otp" type="text" placeholder="6-digit OTP" maxlength="6" style="margin-top:12px">
-      <button onclick="verifyOTP()">Login</button>
-    </div>
+    <input id="email" type="email" placeholder="Email address">
+    <input id="password" type="password" placeholder="Password">
+    <button id="loginBtn" onclick="doLogin()">Login</button>
+    <button onclick="doSignup()" style="background:#2E7D32;margin-top:10px">Naya Account Banao</button>
     <p id="loginErr"></p>
   </div>
 </div>
@@ -90,31 +88,30 @@ const sb = window.supabase.createClient(SB_URL, SB_KEY);
 let currentUser = null;
 
 // ============ AUTH ============
-async function sendOTP(){
-  const phone = document.getElementById('phone').value.trim();
+async function doLogin(){
+  const email = document.getElementById('email').value.trim();
+  const password = document.getElementById('password').value;
   const err = document.getElementById('loginErr');
-  if(!/^[6-9]\d{9}$/.test(phone)){ err.textContent = 'Sahi 10-digit number dalo'; return; }
-  const btn = document.getElementById('otpBtn');
-  btn.disabled = true; btn.textContent = 'Bhej rahe hain...';
+  if(!email || !password){ err.textContent = 'Email aur password dalo'; return; }
   try{
-    const { error } = await sb.auth.signInWithOtp({ phone: '+91'+phone });
-    if(error) throw error;
-    document.getElementById('otpSection').classList.remove('hidden');
-    err.textContent = '';
-    btn.textContent = 'OTP dobara bhejo';
-  }catch(e){ err.textContent = e.message; }
-  btn.disabled = false;
-}
-async function verifyOTP(){
-  const phone = document.getElementById('phone').value.trim();
-  const otp = document.getElementById('otp').value.trim();
-  const err = document.getElementById('loginErr');
-  try{
-    const { data, error } = await sb.auth.verifyOtp({ phone: '+91'+phone, token: otp, type: 'sms' });
+    const { data, error } = await sb.auth.signInWithPassword({ email, password });
     if(error) throw error;
     currentUser = data.user;
     showApp();
-  }catch(e){ err.textContent = e.message || 'OTP galat hai'; }
+  }catch(e){ err.textContent = e.message; }
+}
+async function doSignup(){
+  const email = document.getElementById('email').value.trim();
+  const password = document.getElementById('password').value;
+  const err = document.getElementById('loginErr');
+  if(!email || !password){ err.textContent = 'Email aur password dalo'; return; }
+  if(password.length < 6){ err.textContent = 'Password 6+ characters ka ho'; return; }
+  try{
+    const { data, error } = await sb.auth.signUp({ email, password });
+    if(error) throw error;
+    err.style.color = '#2E7D32';
+    err.textContent = 'Account ban gaya! Ab Login dabao.';
+  }catch(e){ err.style.color = '#c62828'; err.textContent = e.message; }
 }
 async function logout(){
   await sb.auth.signOut();
