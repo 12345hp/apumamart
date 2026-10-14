@@ -12,10 +12,119 @@ const express = require('express');
 const http = require('http');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
-const { getPool, isReady } = require('../db');
-const { normMobile, pubUser, num } = require('../util');
+const { getPool, isReady } = require('./db');
+const { normMobile, pubUser, num } = require('./util');
+
+
+// ---------------------------------------------------------------------------
+// Sentry backend error monitoring (zero-dependency, uses built-in https)
+// ---------------------------------------------------------------------------
+const SENTRY_DSN = 'https://1242c863a8cde973ec79cf6d9e0aa4ba@o4512254073831424.ingest.us.sentry.io/4512254115250176';
+function captureErr(err, ctx) {
+  try {
+    if (!err) return;
+    const m = SENTRY_DSN.match(/https:\/\/([^@]+)@([^\/]+)\/(\d+)/);
+    if (!m) return;
+    const [, key, host, pid] = m;
+    const body = JSON.stringify({
+      event_id: require('crypto').randomBytes(16).toString('hex'),
+      timestamp: new Date().toISOString().slice(0, 19),
+      platform: 'node',
+      level: 'error',
+      exception: { values: [{ type: err.name || 'Error', value: String(err.message || err).slice(0, 2000) }] },
+      extra: ctx || {},
+    });
+    const header = JSON.stringify({ event_id: JSON.parse(body).event_id, sent_at: new Date().toISOString() });
+    const payload = header + '\n{"type":"event","length":' + Buffer.byteLength(body) + '}\n' + body;
+    const req = require('https').request({
+      hostname: host, port: 443, path: `/api/${pid}/envelope/`,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-sentry-envelope',
+        'X-Sentry-Auth': `Sentry sentry_version=7,sentry_key=${key},sentry_client=apumamart-backend/1.0`,
+        'Content-Length': Buffer.byteLength(payload),
+      },
+      timeout: 5000,
+    });
+    req.on('error', () => {});
+    req.on('timeout', () => req.destroy());
+    req.end(payload);
+  } catch (_) {}
+}
+process.on('uncaughtException', (e) => { captureErr(e, { where: 'uncaughtException' }); });
+process.on('unhandledRejection', (e) => { captureErr(e, { where: 'unhandledRejection' }); });
+console.log('[Sentry] Backend error monitoring active (zero-dependency)');
 
 const router = express.Router();
+
+// ---------------------------------------------------------------------------
+// Health check: GET /health — checks DB connectivity. Use in UptimeRobot.
+// Returns 200 {ok:true} when healthy, 503 when DB down.
+// ---------------------------------------------------------------------------
+router.get('/health', async (req, res) => {
+  try {
+    const pool = getPool();
+    await pool.execute('SELECT 1').then(() => {});
+    return res.json({ ok: true, ts: new Date().toISOString() });
+  } catch (e) {
+    captureErr(e, { where: 'health-check' });
+    return res.status(503).json({ ok: false, error: 'db down' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Request timeout: kill requests taking >25s (prevents hanging workers).
+// ---------------------------------------------------------------------------
+router.use((req, res, next) => {
+  const t = setTimeout(() => {
+    if (!res.headersSent) {
+      captureErr(new Error('request timeout'), { path: req.path });
+      res.status(504).json({ error: 'request timeout' });
+    }
+  }, 25000);
+  res.on('finish', () => clearTimeout(t));
+  res.on('close', () => clearTimeout(t));
+  next();
+});
+
+
+// ---------------------------------------------------------------------------
+// Rate limiting: max 100 requests/minute per IP (zero-dependency).
+// Protects against abuse/accidental loops. Webhook + health are exempt.
+// ---------------------------------------------------------------------------
+const RATE_WINDOW_MS = 60 * 1000;
+const RATE_MAX = 100;
+const rateBuckets = new Map(); // ip -> { count, resetAt }
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, b] of rateBuckets) {
+    if (b.resetAt <= now) rateBuckets.delete(ip);
+  }
+}, RATE_WINDOW_MS).unref();
+function rateLimit(req, res, next) {
+  try {
+    const path = req.path || '';
+    if (path === '/razorpay-webhook' || path === '/health') return next();
+    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim()
+      || req.socket?.remoteAddress || 'unknown';
+    const now = Date.now();
+    let b = rateBuckets.get(ip);
+    if (!b || b.resetAt <= now) {
+      b = { count: 0, resetAt: now + RATE_WINDOW_MS };
+      rateBuckets.set(ip, b);
+    }
+    b.count++;
+    res.setHeader('X-RateLimit-Limit', RATE_MAX);
+    res.setHeader('X-RateLimit-Remaining', Math.max(0, RATE_MAX - b.count));
+    if (b.count > RATE_MAX) {
+      captureErr(new Error('rate limit hit'), { ip, path });
+      return res.status(429).json({ error: 'too many requests, slow down' });
+    }
+    next();
+  } catch (_) { next(); }
+}
+router.use(rateLimit);
+
 
 // ---------------------------------------------------------------------------
 // Internal forward: call our own REST endpoints via public HTTPS URL.
@@ -1157,18 +1266,51 @@ function genBranchToken(){
 async function hCreateBranch(req, args) {
   const { user } = needAuth(await authUser(req));
   const pool = getPool();
+  // V7 BRANCH PLAN GATE: creating a branch needs the Branch plan (₹699/month or
+  // ₹4,999/year). Platform owners/admins bypass. Mirrors the frontend gate in
+  // branches.html — the API must enforce it too, not just the page.
+  const isOwner = user.role === 'owner' || user.role === 'admin';
+  if (!isOwner) {
+    let subRows = [];
+    try {
+      [subRows] = await pool.execute(
+        'SELECT status, product_id FROM subscriptions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
+        [user.id]
+      );
+    } catch (_) { subRows = []; }
+    const sub = subRows[0];
+    const hasBranchPlan = !!(sub &&
+      ['active', 'verified', 'trialing'].includes(sub.status) &&
+      String(sub.product_id || '').toLowerCase().includes('branch'));
+    if (!hasBranchPlan) {
+      throw Object.assign(new Error('Branch plan required: ₹699/month or ₹4,999/year'), { status: 402 });
+    }
+  }
   const name = String(args.name || '').trim();
   if (!name) throw Object.assign(new Error('Branch name required'), { status: 400 });
   const token = genBranchToken();
+  const mgrMobile = String(args.manager_mobile || '').trim() || null;
+  const mgrName = String(args.manager_name || '').trim() || (name + ' Manager');
+  // V8: Create dedicated user account for this branch (manager auto-login).
+  // Data isolation via user_id which all APIs already enforce.
+  let branchUserId = null;
+  try {
+    const loginMobile = mgrMobile || ('br' + Date.now().toString(36));
+    const [ur] = await pool.execute(
+      "INSERT INTO users (name, mobile, role, business_name) VALUES (?, ?, 'staff', ?)",
+      [mgrName, loginMobile, name]
+    );
+    branchUserId = ur.insertId;
+  } catch (e) {
+    console.error('[createBranch] branch user failed:', e.message);
+  }
   const [r] = await pool.execute(
-    `INSERT INTO branches (owner_user_id, name, address, phone, manager_name, manager_mobile, access_token, token_active)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
+    `INSERT INTO branches (owner_user_id, name, address, phone, manager_name, manager_mobile, access_token, token_active, branch_user_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)`,
     [user.id, name,
      String(args.address || '').trim() || null,
      String(args.phone || '').trim() || null,
-     String(args.manager_name || '').trim() || null,
-     String(args.manager_mobile || '').trim() || null,
-     token]
+     mgrName, mgrMobile, token, branchUserId]
   );
   return { ok: true, branch_id: r.insertId, access_token: token,
            manager_link: '/branch.html?token=' + token };
@@ -1237,7 +1379,7 @@ async function hGetBranchByToken(req, args) {
     throw Object.assign(new Error('Invalid link'), { status: 400 });
   const [rows] = await pool.execute(
     `SELECT b.id, b.name, b.address, b.phone, b.manager_name, b.manager_mobile,
-            u.business_name AS owner_business
+            b.branch_user_id, u.business_name AS owner_business
      FROM branches b JOIN users u ON u.id = b.owner_user_id
      WHERE b.access_token = ? AND b.token_active = 1`,
     [token]
@@ -1245,8 +1387,21 @@ async function hGetBranchByToken(req, args) {
   if (!rows.length)
     throw Object.assign(new Error('This link is expired or invalid. Ask the owner for a new link.'), { status: 403 });
   const b = rows[0];
+  // V8: Auto-login session for branch user -> manager gets FULL app locked to branch.
+  let bst = null;
+  if (b.branch_user_id) {
+    try {
+      bst = crypto.randomBytes(32).toString('hex');
+      const exp = new Date(Date.now() + 365*24*3600*1000);
+      await pool.execute(
+        "INSERT INTO sessions (user_id, token_hash, expires_at) VALUES (?, ?, ?)",
+        [b.branch_user_id, crypto.createHash('sha256').update(bst).digest('hex'), exp]
+      );
+    } catch (e) { console.error('[branchToken] session failed:', e.message); bst = null; }
+  }
   return { ok: true, branch: { id: b.id, name: b.name, address: b.address,
-    phone: b.phone, manager_name: b.manager_name, owner_business: b.owner_business } };
+    phone: b.phone, manager_name: b.manager_name, owner_business: b.owner_business },
+    session_token: bst, branch_user_id: b.branch_user_id || null };
 }
 
 async function hListPosAdvance(req, args) {
@@ -1372,6 +1527,42 @@ async function hBranchCollections(req, args) {
       collection: total, period: period, start_date: startDate, end_date: endDate });
   }
   return { ok: true, branches: out, grand: grand, period: period, start_date: startDate, end_date: endDate };
+}
+
+// V8: Owner sees LIVE hisab of every branch + grand total.
+// Each branch has its own user account (branch_user_id); bills live under it.
+async function hGetAllBranchesHisab(req, args) {
+  const { user } = needAuth(await authUser(req));
+  const pool = getPool();
+  const [branches] = await pool.execute(
+    'SELECT id, name, manager_name, branch_user_id FROM branches WHERE owner_user_id = ? ORDER BY name',
+    [user.id]
+  ).catch(() => [[]]);
+  const out = [];
+  let gSales = 0, gBills = 0, gPaid = 0, gDue = 0;
+  for (const b of branches) {
+    let sales = 0, bills = 0, paid = 0, due = 0;
+    if (b.branch_user_id) {
+      try {
+        const [r] = await pool.execute(
+          `SELECT COUNT(*) AS cnt, COALESCE(SUM(total),0) AS sales,
+                  COALESCE(SUM(joma),0) AS paid,
+                  COALESCE(SUM(total - joma),0) AS due
+           FROM bills WHERE user_id = ?`,
+          [b.branch_user_id]
+        );
+        bills = r[0].cnt || 0;
+        sales = parseFloat(r[0].sales) || 0;
+        paid = parseFloat(r[0].paid) || 0;
+        due = parseFloat(r[0].due) || 0;
+      } catch (_) {}
+    }
+    gSales += sales; gBills += bills; gPaid += paid; gDue += due;
+    out.push({ id: b.id, name: b.name, manager_name: b.manager_name,
+      bills: bills, sales: sales, paid: paid, due: due });
+  }
+  return { ok: true, branches: out,
+    grand: { bills: gBills, sales: gSales, paid: gPaid, due: gDue } };
 }
 
 async function hListPosSales(req, args) {
@@ -1629,7 +1820,9 @@ async function hGetMySubscription(req, args) {
     }
   }
   const hasMultiBranch = plan && plan.includes('branch');
-  return { ok: true, isPremium, isTrial, trialDaysLeft, hasMultiBranch: !!hasMultiBranch, plan };
+  // V7: owner bypass for the branch paywall (frontend branches.html checks sub.isOwner)
+  const isOwner = user.role === 'owner' || user.role === 'admin';
+  return { ok: true, isPremium, isTrial, trialDaysLeft, hasMultiBranch: !!hasMultiBranch, plan, isOwner };
 }
 
 async function hVerifySubscription(req, args) {
@@ -1970,6 +2163,7 @@ const DIRECT = {
   updateBranchManager: hUpdateBranchManager,
   deleteBranch: hDeleteBranch,
   getBranchByToken: hGetBranchByToken,
+  getAllBranchesHisab: hGetAllBranchesHisab,
   listPosAdvance: hListPosAdvance,
   addPosAdvance: hAddPosAdvance,
   markPosAttendance: hMarkPosAttendance,
@@ -2060,6 +2254,89 @@ router.post('/', async (req, res, next) => {
     }
     return res.status(400).json({ error: `unknown action: ${action}` });
   } catch (e) { next(e); }
+});
+
+
+// ---------------------------------------------------------------------------
+// Razorpay webhook: server-to-server payment notifications.
+// Razorpay POSTs here on payment.captured / payment.failed.
+// URL in Razorpay dashboard: https://api.apumamart.com/api/actions/razorpay-webhook
+// Secret stored in env: RAZORPAY_WEBHOOK_SECRET
+// NOTE: uses express.raw() so signature verification gets the exact body.
+// ---------------------------------------------------------------------------
+router.post('/razorpay-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  try {
+    const secret = process.env.RAZORPAY_WEBHOOK_SECRET || '';
+    if (!secret) {
+      console.error('[webhook] RAZORPAY_WEBHOOK_SECRET not set');
+      return res.status(500).json({ error: 'webhook not configured' });
+    }
+    const signature = req.headers['x-razorpay-signature'] || '';
+    const rawBody = req.body ? req.body.toString('utf8') : '';
+    const expected = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
+    const a = Buffer.from(expected, 'utf8');
+    const b = Buffer.from(String(signature), 'utf8');
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      console.error('[webhook] invalid signature');
+      return res.status(400).json({ error: 'invalid signature' });
+    }
+    let event;
+    try { event = JSON.parse(rawBody); }
+    catch (_) { return res.status(400).json({ error: 'bad json' }); }
+
+    const type = event.event || '';
+    const payment = (event.payload && event.payload.payment && event.payload.payment.entity) || {};
+    const orderId = String(payment.order_id || '');
+    const paymentId = String(payment.id || '');
+
+    if (type === 'payment.captured' && orderId) {
+      const pool = getPool();
+      const [o] = await pool.execute(
+        'SELECT id, user_id, plan_id, status FROM web_subscription_orders WHERE razorpay_order_id = ?',
+        [orderId]
+      ).catch(() => [[]]);
+      if (o.length && o[0].status !== 'paid') {
+        const plan = (typeof WEB_PLANS !== 'undefined' ? WEB_PLANS : {})[o[0].plan_id];
+        await pool.execute(
+          `UPDATE web_subscription_orders SET razorpay_payment_id = ?, status = 'paid', paid_at = NOW() WHERE id = ?`,
+          [paymentId, o[0].id]
+        ).catch(e => captureErr(e, { where: 'webhook-update-order' }));
+        // Activate subscription (same as hVerifyWebSubscription).
+        await pool.execute(
+          `INSERT INTO subscriptions (user_id, product_id, purchase_token, status) VALUES (?,?,?, 'verified')`,
+          [o[0].user_id, o[0].plan_id, paymentId]
+        ).catch(e => captureErr(e, { where: 'webhook-subscriptions' }));
+        if (plan) {
+          const expires = new Date();
+          expires.setMonth(expires.getMonth() + (plan.months || 1));
+          await pool.execute(
+            `INSERT INTO user_subscriptions (user_id, tier, plan_id, expires_at)
+             VALUES (?,?,?,?)
+             ON DUPLICATE KEY UPDATE tier = VALUES(tier), plan_id = VALUES(plan_id),
+               expires_at = VALUES(expires_at), updated_at = NOW()`,
+            [o[0].user_id, plan.tier, o[0].plan_id, expires]
+          ).catch(e => captureErr(e, { where: 'webhook-user-subscriptions' }));
+        }
+        console.log('[webhook] payment.captured -> order paid:', orderId);
+      } else {
+        console.log('[webhook] payment.captured ignored (order missing/already paid):', orderId);
+      }
+    } else if (type === 'payment.failed' && orderId) {
+      const pool = getPool();
+      await pool.execute(
+        `UPDATE web_subscription_orders SET status = 'failed' WHERE razorpay_order_id = ? AND status != 'paid'`,
+        [orderId]
+      ).catch(e => captureErr(e, { where: 'webhook-failed' }));
+      console.log('[webhook] payment.failed:', orderId);
+    } else {
+      console.log('[webhook] ignored event:', type);
+    }
+    return res.json({ ok: true });
+  } catch (e) {
+    captureErr(e, { where: 'razorpay-webhook' });
+    console.error('[webhook] error:', e.message);
+    return res.status(500).json({ error: 'webhook error' });
+  }
 });
 
 module.exports = router;
