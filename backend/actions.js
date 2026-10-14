@@ -2124,4 +2124,87 @@ router.post('/', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+
+// ---------------------------------------------------------------------------
+// Razorpay webhook: server-to-server payment notifications.
+// Razorpay POSTs here on payment.captured / payment.failed.
+// URL in Razorpay dashboard: https://api.apumamart.com/api/actions/razorpay-webhook
+// Secret stored in env: RAZORPAY_WEBHOOK_SECRET
+// NOTE: uses express.raw() so signature verification gets the exact body.
+// ---------------------------------------------------------------------------
+router.post('/razorpay-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  try {
+    const secret = process.env.RAZORPAY_WEBHOOK_SECRET || '';
+    if (!secret) {
+      console.error('[webhook] RAZORPAY_WEBHOOK_SECRET not set');
+      return res.status(500).json({ error: 'webhook not configured' });
+    }
+    const signature = req.headers['x-razorpay-signature'] || '';
+    const rawBody = req.body ? req.body.toString('utf8') : '';
+    const expected = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
+    const a = Buffer.from(expected, 'utf8');
+    const b = Buffer.from(String(signature), 'utf8');
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      console.error('[webhook] invalid signature');
+      return res.status(400).json({ error: 'invalid signature' });
+    }
+    let event;
+    try { event = JSON.parse(rawBody); }
+    catch (_) { return res.status(400).json({ error: 'bad json' }); }
+
+    const type = event.event || '';
+    const payment = (event.payload && event.payload.payment && event.payload.payment.entity) || {};
+    const orderId = String(payment.order_id || '');
+    const paymentId = String(payment.id || '');
+
+    if (type === 'payment.captured' && orderId) {
+      const pool = getPool();
+      const [o] = await pool.execute(
+        'SELECT id, user_id, plan_id, status FROM web_subscription_orders WHERE razorpay_order_id = ?',
+        [orderId]
+      ).catch(() => [[]]);
+      if (o.length && o[0].status !== 'paid') {
+        const plan = (typeof WEB_PLANS !== 'undefined' ? WEB_PLANS : {})[o[0].plan_id];
+        await pool.execute(
+          `UPDATE web_subscription_orders SET razorpay_payment_id = ?, status = 'paid', paid_at = NOW() WHERE id = ?`,
+          [paymentId, o[0].id]
+        ).catch(e => captureErr(e, { where: 'webhook-update-order' }));
+        // Activate subscription (same as hVerifyWebSubscription).
+        await pool.execute(
+          `INSERT INTO subscriptions (user_id, product_id, purchase_token, status) VALUES (?,?,?, 'verified')`,
+          [o[0].user_id, o[0].plan_id, paymentId]
+        ).catch(e => captureErr(e, { where: 'webhook-subscriptions' }));
+        if (plan) {
+          const expires = new Date();
+          expires.setMonth(expires.getMonth() + (plan.months || 1));
+          await pool.execute(
+            `INSERT INTO user_subscriptions (user_id, tier, plan_id, expires_at)
+             VALUES (?,?,?,?)
+             ON DUPLICATE KEY UPDATE tier = VALUES(tier), plan_id = VALUES(plan_id),
+               expires_at = VALUES(expires_at), updated_at = NOW()`,
+            [o[0].user_id, plan.tier, o[0].plan_id, expires]
+          ).catch(e => captureErr(e, { where: 'webhook-user-subscriptions' }));
+        }
+        console.log('[webhook] payment.captured -> order paid:', orderId);
+      } else {
+        console.log('[webhook] payment.captured ignored (order missing/already paid):', orderId);
+      }
+    } else if (type === 'payment.failed' && orderId) {
+      const pool = getPool();
+      await pool.execute(
+        `UPDATE web_subscription_orders SET status = 'failed' WHERE razorpay_order_id = ? AND status != 'paid'`,
+        [orderId]
+      ).catch(e => captureErr(e, { where: 'webhook-failed' }));
+      console.log('[webhook] payment.failed:', orderId);
+    } else {
+      console.log('[webhook] ignored event:', type);
+    }
+    return res.json({ ok: true });
+  } catch (e) {
+    captureErr(e, { where: 'razorpay-webhook' });
+    console.error('[webhook] error:', e.message);
+    return res.status(500).json({ error: 'webhook error' });
+  }
+});
+
 module.exports = router;
