@@ -58,6 +58,44 @@ console.log('[Sentry] Backend error monitoring active (zero-dependency)');
 const router = express.Router();
 
 // ---------------------------------------------------------------------------
+// Rate limiting: max 100 requests/minute per IP (zero-dependency).
+// Protects against abuse/accidental loops. Webhook + health are exempt.
+// ---------------------------------------------------------------------------
+const RATE_WINDOW_MS = 60 * 1000;
+const RATE_MAX = 100;
+const rateBuckets = new Map(); // ip -> { count, resetAt }
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, b] of rateBuckets) {
+    if (b.resetAt <= now) rateBuckets.delete(ip);
+  }
+}, RATE_WINDOW_MS).unref();
+function rateLimit(req, res, next) {
+  try {
+    const path = req.path || '';
+    if (path === '/razorpay-webhook' || path === '/health') return next();
+    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim()
+      || req.socket?.remoteAddress || 'unknown';
+    const now = Date.now();
+    let b = rateBuckets.get(ip);
+    if (!b || b.resetAt <= now) {
+      b = { count: 0, resetAt: now + RATE_WINDOW_MS };
+      rateBuckets.set(ip, b);
+    }
+    b.count++;
+    res.setHeader('X-RateLimit-Limit', RATE_MAX);
+    res.setHeader('X-RateLimit-Remaining', Math.max(0, RATE_MAX - b.count));
+    if (b.count > RATE_MAX) {
+      captureErr(new Error('rate limit hit'), { ip, path });
+      return res.status(429).json({ error: 'too many requests, slow down' });
+    }
+    next();
+  } catch (_) { next(); }
+}
+router.use(rateLimit);
+
+
+// ---------------------------------------------------------------------------
 // Internal forward: call our own REST endpoints via public HTTPS URL.
 // (Hostinger blocks loopback HTTP to 127.0.0.1, so we use the public URL.)
 // ---------------------------------------------------------------------------
