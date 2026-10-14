@@ -1157,6 +1157,26 @@ function genBranchToken(){
 async function hCreateBranch(req, args) {
   const { user } = needAuth(await authUser(req));
   const pool = getPool();
+  // V7 BRANCH PLAN GATE: creating a branch needs the Branch plan (₹699/month or
+  // ₹4,999/year). Platform owners/admins bypass. Mirrors the frontend gate in
+  // branches.html — the API must enforce it too, not just the page.
+  const isOwner = user.role === 'owner' || user.role === 'admin';
+  if (!isOwner) {
+    let subRows = [];
+    try {
+      [subRows] = await pool.execute(
+        'SELECT status, product_id FROM subscriptions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
+        [user.id]
+      );
+    } catch (_) { subRows = []; }
+    const sub = subRows[0];
+    const hasBranchPlan = !!(sub &&
+      ['active', 'verified', 'trialing'].includes(sub.status) &&
+      String(sub.product_id || '').toLowerCase().includes('branch'));
+    if (!hasBranchPlan) {
+      throw Object.assign(new Error('Branch plan required: ₹699/month or ₹4,999/year'), { status: 402 });
+    }
+  }
   const name = String(args.name || '').trim();
   if (!name) throw Object.assign(new Error('Branch name required'), { status: 400 });
   const token = genBranchToken();
@@ -1629,7 +1649,9 @@ async function hGetMySubscription(req, args) {
     }
   }
   const hasMultiBranch = plan && plan.includes('branch');
-  return { ok: true, isPremium, isTrial, trialDaysLeft, hasMultiBranch: !!hasMultiBranch, plan };
+  // V7: owner bypass for the branch paywall (frontend branches.html checks sub.isOwner)
+  const isOwner = user.role === 'owner' || user.role === 'admin';
+  return { ok: true, isPremium, isTrial, trialDaysLeft, hasMultiBranch: !!hasMultiBranch, plan, isOwner };
 }
 
 async function hVerifySubscription(req, args) {
