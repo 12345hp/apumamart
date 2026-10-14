@@ -426,9 +426,14 @@ async function initDb() {
       password: DB_PASSWORD || '',
       database: DB_NAME,
       waitForConnections: true,
-      connectionLimit: 5,
-      queueLimit: 0,
+      connectionLimit: 10,
+      queueLimit: 50,
+      connectTimeout: 10000,
       charset: 'utf8mb4',
+    });
+    // Pool error handler: log but don't crash (pool recovers itself).
+    pool.on('error', (err) => {
+      console.error('[db] pool error:', err.message);
     });
     const c = await pool.getConnection();
     try { await c.ping(); } finally { c.release(); }
