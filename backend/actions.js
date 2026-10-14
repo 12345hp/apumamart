@@ -12,8 +12,8 @@ const express = require('express');
 const http = require('http');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
-const { getPool, isReady } = require('../db');
-const { normMobile, pubUser, num } = require('../util');
+const { getPool, isReady } = require('./db');
+const { normMobile, pubUser, num } = require('./util');
 
 
 // ---------------------------------------------------------------------------
