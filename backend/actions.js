@@ -12,119 +12,10 @@ const express = require('express');
 const http = require('http');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
-const { getPool, isReady } = require('./db');
-const { normMobile, pubUser, num } = require('./util');
-
-
-// ---------------------------------------------------------------------------
-// Sentry backend error monitoring (zero-dependency, uses built-in https)
-// ---------------------------------------------------------------------------
-const SENTRY_DSN = 'https://1242c863a8cde973ec79cf6d9e0aa4ba@o4512254073831424.ingest.us.sentry.io/4512254115250176';
-function captureErr(err, ctx) {
-  try {
-    if (!err) return;
-    const m = SENTRY_DSN.match(/https:\/\/([^@]+)@([^\/]+)\/(\d+)/);
-    if (!m) return;
-    const [, key, host, pid] = m;
-    const body = JSON.stringify({
-      event_id: require('crypto').randomBytes(16).toString('hex'),
-      timestamp: new Date().toISOString().slice(0, 19),
-      platform: 'node',
-      level: 'error',
-      exception: { values: [{ type: err.name || 'Error', value: String(err.message || err).slice(0, 2000) }] },
-      extra: ctx || {},
-    });
-    const header = JSON.stringify({ event_id: JSON.parse(body).event_id, sent_at: new Date().toISOString() });
-    const payload = header + '\n{"type":"event","length":' + Buffer.byteLength(body) + '}\n' + body;
-    const req = require('https').request({
-      hostname: host, port: 443, path: `/api/${pid}/envelope/`,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-sentry-envelope',
-        'X-Sentry-Auth': `Sentry sentry_version=7,sentry_key=${key},sentry_client=apumamart-backend/1.0`,
-        'Content-Length': Buffer.byteLength(payload),
-      },
-      timeout: 5000,
-    });
-    req.on('error', () => {});
-    req.on('timeout', () => req.destroy());
-    req.end(payload);
-  } catch (_) {}
-}
-process.on('uncaughtException', (e) => { captureErr(e, { where: 'uncaughtException' }); });
-process.on('unhandledRejection', (e) => { captureErr(e, { where: 'unhandledRejection' }); });
-console.log('[Sentry] Backend error monitoring active (zero-dependency)');
+const { getPool, isReady } = require('../db');
+const { normMobile, pubUser, num } = require('../util');
 
 const router = express.Router();
-
-// ---------------------------------------------------------------------------
-// Health check: GET /health — checks DB connectivity. Use in UptimeRobot.
-// Returns 200 {ok:true} when healthy, 503 when DB down.
-// ---------------------------------------------------------------------------
-router.get('/health', async (req, res) => {
-  try {
-    const pool = getPool();
-    await pool.execute('SELECT 1').then(() => {});
-    return res.json({ ok: true, ts: new Date().toISOString() });
-  } catch (e) {
-    captureErr(e, { where: 'health-check' });
-    return res.status(503).json({ ok: false, error: 'db down' });
-  }
-});
-
-// ---------------------------------------------------------------------------
-// Request timeout: kill requests taking >25s (prevents hanging workers).
-// ---------------------------------------------------------------------------
-router.use((req, res, next) => {
-  const t = setTimeout(() => {
-    if (!res.headersSent) {
-      captureErr(new Error('request timeout'), { path: req.path });
-      res.status(504).json({ error: 'request timeout' });
-    }
-  }, 25000);
-  res.on('finish', () => clearTimeout(t));
-  res.on('close', () => clearTimeout(t));
-  next();
-});
-
-
-// ---------------------------------------------------------------------------
-// Rate limiting: max 100 requests/minute per IP (zero-dependency).
-// Protects against abuse/accidental loops. Webhook + health are exempt.
-// ---------------------------------------------------------------------------
-const RATE_WINDOW_MS = 60 * 1000;
-const RATE_MAX = 100;
-const rateBuckets = new Map(); // ip -> { count, resetAt }
-setInterval(() => {
-  const now = Date.now();
-  for (const [ip, b] of rateBuckets) {
-    if (b.resetAt <= now) rateBuckets.delete(ip);
-  }
-}, RATE_WINDOW_MS).unref();
-function rateLimit(req, res, next) {
-  try {
-    const path = req.path || '';
-    if (path === '/razorpay-webhook' || path === '/health') return next();
-    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim()
-      || req.socket?.remoteAddress || 'unknown';
-    const now = Date.now();
-    let b = rateBuckets.get(ip);
-    if (!b || b.resetAt <= now) {
-      b = { count: 0, resetAt: now + RATE_WINDOW_MS };
-      rateBuckets.set(ip, b);
-    }
-    b.count++;
-    res.setHeader('X-RateLimit-Limit', RATE_MAX);
-    res.setHeader('X-RateLimit-Remaining', Math.max(0, RATE_MAX - b.count));
-    if (b.count > RATE_MAX) {
-      captureErr(new Error('rate limit hit'), { ip, path });
-      return res.status(429).json({ error: 'too many requests, slow down' });
-    }
-    next();
-  } catch (_) { next(); }
-}
-router.use(rateLimit);
-
 
 // ---------------------------------------------------------------------------
 // Internal forward: call our own REST endpoints via public HTTPS URL.
@@ -359,76 +250,6 @@ function msg91Get(path) {
   });
 }
 
-// ---------------------------------------------------------------------------
-// Security pack (2026-10-15): OTP brute-force lock, login alerts, activity log
-// - 5 failed OTP attempts → 15 minute lock per mobile
-// - Every successful owner/admin login is logged (login_alerts + activity log)
-// - Admin actions logged via logActivity()
-// ---------------------------------------------------------------------------
-const OTP_MAX_ATTEMPTS = 5;
-const OTP_LOCK_MINUTES = 15;
-
-async function checkOtpLock(pool, mobile) {
-  try {
-    const [rows] = await pool.execute(
-      'SELECT attempts, locked_until FROM otp_attempts WHERE mobile = ?', [mobile]
-    );
-    const r = rows[0];
-    if (r && r.locked_until && new Date(r.locked_until) > new Date()) {
-      const mins = Math.ceil((new Date(r.locked_until) - new Date()) / 60000);
-      const e = new Error(`bahut galat OTP! ${mins} minute ruko phir try karo.`);
-      e.status = 429;
-      throw e;
-    }
-  } catch (e) { if (e.status === 429) throw e; /* table may not exist yet */ }
-}
-
-async function recordOtpFailure(pool, mobile) {
-  try {
-    await pool.execute(
-      `INSERT INTO otp_attempts (mobile, attempts, locked_until) VALUES (?, 1, NULL)
-       ON DUPLICATE KEY UPDATE attempts = attempts + 1, last_attempt_at = NOW()`,
-      [mobile]
-    );
-    const [rows] = await pool.execute('SELECT attempts FROM otp_attempts WHERE mobile = ?', [mobile]);
-    if (rows[0] && rows[0].attempts >= OTP_MAX_ATTEMPTS) {
-      await pool.execute(
-        'UPDATE otp_attempts SET locked_until = DATE_ADD(NOW(), INTERVAL ? MINUTE), attempts = 0 WHERE mobile = ?',
-        [OTP_LOCK_MINUTES, mobile]
-      );
-      const e = new Error(`5 galat OTP! ${OTP_LOCK_MINUTES} minute ke liye lock.`);
-      e.status = 429;
-      throw e;
-    }
-  } catch (e) { if (e.status === 429) throw e; /* ignore */ }
-}
-
-async function clearOtpAttempts(pool, mobile) {
-  try { await pool.execute('DELETE FROM otp_attempts WHERE mobile = ?', [mobile]); } catch (_) {}
-}
-
-async function logActivity(pool, userId, mobile, action, details, req) {
-  try {
-    const ip = (req && (req.headers['x-forwarded-for'] || req.ip || req.connection?.remoteAddress) || '').toString().slice(0, 45);
-    await pool.execute(
-      'INSERT INTO admin_activity_log (user_id, mobile, action, details, ip) VALUES (?, ?, ?, ?, ?)',
-      [userId || null, mobile || null, action, details ? String(details).slice(0, 2000) : null, ip || null]
-    );
-  } catch (_) { /* never break the request for logging */ }
-}
-
-async function logLoginAlert(pool, user, req) {
-  try {
-    const ip = (req && (req.headers['x-forwarded-for'] || req.ip || req.connection?.remoteAddress) || '').toString().slice(0, 45);
-    const ua = (req && req.headers['user-agent'] || '').toString().slice(0, 255);
-    await pool.execute(
-      'INSERT INTO login_alerts (user_id, mobile, ip, user_agent) VALUES (?, ?, ?, ?)',
-      [user.id, user.mobile, ip || null, ua || null]
-    );
-    await logActivity(pool, user.id, user.mobile, 'login', `role=${user.role} ip=${ip}`, req);
-  } catch (_) {}
-}
-
 async function hRequestOwnerOtp(req, args) {
   const mobile = String(args.mobile || '').replace(/\D/g, '').slice(-10);
   if (mobile.length !== 10) { const e = new Error('10 digit mobile required'); e.status = 400; throw e; }
@@ -442,8 +263,21 @@ async function hRequestOwnerOtp(req, args) {
     user = u2[0];
   }
   if (!user) { const e = new Error('sirf owner/admin OTP login kar sakte hain'); e.status = 403; throw e; }
+  // Generate OTP locally (we verify from our DB, not MSG91)
+  const otp = String(Math.floor(100000 + Math.random() * 900000));
+  const otpHash = crypto.createHash('sha256').update(otp).digest('hex');
+  const expiresAt = Date.now() + 5 * 60 * 1000; // 5 min
+  try {
+    await pool.execute('DELETE FROM mart_otps WHERE mobile = ?', [mobile]);
+    await pool.execute(
+      'INSERT INTO mart_otps (mobile, otp_hash, attempts, expires_at, created_at) VALUES (?, ?, 0, ?, ?)',
+      [mobile, otpHash, expiresAt, Date.now()]
+    );
+  } catch (_) { /* table may not exist yet, continue */ }
+  // Send via MSG91 with our OTP + DLT template
   const dltTemplate = process.env.MSG91_DLT_TEMPLATE_ID || '';
-  const otpPath = `/api/v5/otp?mobile=91${mobile}` + (dltTemplate ? `&template_id=${encodeURIComponent(dltTemplate)}` : '');
+  let otpPath = `/api/v5/otp?mobile=91${mobile}&otp=${otp}`;
+  if (dltTemplate) otpPath += `&template_id=${encodeURIComponent(dltTemplate)}`;
   const result = await msg91Get(otpPath);
   if (result && result.type === 'success') {
     return { ok: true, message: 'OTP bheja gaya!' };
@@ -456,16 +290,39 @@ async function hVerifyOwnerOtp(req, args) {
   const otp = String(args.otp || '').trim();
   if (mobile.length !== 10 || !otp) { const e = new Error('mobile aur otp required'); e.status = 400; throw e; }
   const pool = getPool();
-  // Security: 5 failed attempts → 15 min lock
-  await checkOtpLock(pool, mobile);
-  const result = await msg91Get(`/api/v5/otp/verify?mobile=91${mobile}&otp=${encodeURIComponent(otp)}`);
-  const verified = result && (result.type === 'success' || result.message === 'OTP verified successfully.');
-  if (!verified) {
-    await recordOtpFailure(pool, mobile);
-    await logActivity(pool, null, mobile, 'otp_failed', 'galat OTP', req);
-    const e = new Error('galat OTP!'); e.status = 400; throw e;
+  // Verify against our local DB (we generate OTP ourselves)
+  let verified = false;
+  try {
+    const [rows] = await pool.execute(
+      'SELECT * FROM mart_otps WHERE mobile = ? AND consumed_at IS NULL ORDER BY created_at DESC LIMIT 1',
+      [mobile]
+    );
+    const rec = rows[0];
+    if (rec) {
+      if (Date.now() > Number(rec.expires_at)) {
+        await pool.execute('DELETE FROM mart_otps WHERE mobile = ?', [mobile]);
+      } else if (Number(rec.attempts) >= 5) {
+        const e = new Error('5 galat attempts! 15 min ruko.');
+        e.status = 429; throw e;
+      } else {
+        const hash = crypto.createHash('sha256').update(otp).digest('hex');
+        if (hash === rec.otp_hash) {
+          verified = true;
+          await pool.execute('UPDATE mart_otps SET consumed_at = ? WHERE id = ?', [Date.now(), rec.id]);
+        } else {
+          await pool.execute('UPDATE mart_otps SET attempts = attempts + 1 WHERE id = ?', [rec.id]);
+        }
+      }
+    }
+  } catch (_) { /* fall through to MSG91 */ }
+  // Fallback: try MSG91 verification (for OTPs sent before this change)
+  if (!verified && process.env.MSG91_AUTH_KEY) {
+    try {
+      const result = await msg91Get(`/api/v5/otp/verify?mobile=91${mobile}&otp=${encodeURIComponent(otp)}`);
+      if (result && (result.type === 'success' || result.message === 'OTP verified successfully.')) verified = true;
+    } catch (_) {}
   }
-  await clearOtpAttempts(pool, mobile);
+  if (!verified) { const e = new Error('galat OTP!'); e.status = 400; throw e; }
   const [u] = await pool.execute("SELECT * FROM users WHERE (mobile = ? OR mobile = ? OR mobile = ?) AND role IN ('owner','admin')", [mobile, '91'+mobile, '0'+mobile]);
   const user = u[0];
   if (!user) { const e = new Error('user not found'); e.status = 404; throw e; }
@@ -474,8 +331,6 @@ async function hVerifyOwnerOtp(req, args) {
   const token = crypto.randomBytes(32).toString('hex');
   const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
   await pool.execute('INSERT INTO sessions (user_id, token_hash, expires_at) VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 30 DAY))', [user.id, tokenHash]);
-  // Security: login alert + activity log
-  await logLoginAlert(pool, user, req);
   return { ok: true, account: { session_token: token, user: pubUser(user) } };
 }
 
@@ -572,31 +427,6 @@ async function hAdminUserDetail(req, args) {
   const [branches] = await pool.execute('SELECT id, name, manager_name, manager_mobile, created_at FROM branches WHERE owner_user_id = ?', [userId]).catch(() => [[]]);
   const [sess] = await pool.execute('SELECT MAX(last_seen_at) AS last_seen FROM sessions WHERE user_id = ?', [userId]).catch(() => [[{}]]);
   return { ok: true, user: u[0], subscription: subs[0] || null, orders, branches, last_seen: (sess[0] || {}).last_seen || null };
-}
-
-// Security pack: owner views admin activity log + login alerts
-async function hGetAdminActivityLog(req, args) {
-  const { user } = needAuth(await authUser(req));
-  needOwner(user);
-  const pool = getPool();
-  const limit = Math.min(Number(args.limit) || 50, 200);
-  const [logs] = await pool.execute(
-    'SELECT id, user_id, mobile, action, details, ip, created_at FROM admin_activity_log ORDER BY id DESC LIMIT ?',
-    [String(limit)]
-  ).catch(() => [[]]);
-  return { ok: true, logs: logs || [] };
-}
-
-async function hGetLoginAlerts(req, args) {
-  const { user } = needAuth(await authUser(req));
-  needOwner(user);
-  const pool = getPool();
-  const limit = Math.min(Number(args.limit) || 50, 200);
-  const [alerts] = await pool.execute(
-    'SELECT id, user_id, mobile, ip, user_agent, created_at FROM login_alerts ORDER BY id DESC LIMIT ?',
-    [String(limit)]
-  ).catch(() => [[]]);
-  return { ok: true, alerts: alerts || [] };
 }
 
 async function hAdminSubscriptions(req, args) {
@@ -1372,51 +1202,18 @@ function genBranchToken(){
 async function hCreateBranch(req, args) {
   const { user } = needAuth(await authUser(req));
   const pool = getPool();
-  // V7 BRANCH PLAN GATE: creating a branch needs the Branch plan (₹699/month or
-  // ₹4,999/year). Platform owners/admins bypass. Mirrors the frontend gate in
-  // branches.html — the API must enforce it too, not just the page.
-  const isOwner = user.role === 'owner' || user.role === 'admin';
-  if (!isOwner) {
-    let subRows = [];
-    try {
-      [subRows] = await pool.execute(
-        'SELECT status, product_id FROM subscriptions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
-        [user.id]
-      );
-    } catch (_) { subRows = []; }
-    const sub = subRows[0];
-    const hasBranchPlan = !!(sub &&
-      ['active', 'verified', 'trialing'].includes(sub.status) &&
-      String(sub.product_id || '').toLowerCase().includes('branch'));
-    if (!hasBranchPlan) {
-      throw Object.assign(new Error('Branch plan required: ₹699/month or ₹4,999/year'), { status: 402 });
-    }
-  }
   const name = String(args.name || '').trim();
   if (!name) throw Object.assign(new Error('Branch name required'), { status: 400 });
   const token = genBranchToken();
-  const mgrMobile = String(args.manager_mobile || '').trim() || null;
-  const mgrName = String(args.manager_name || '').trim() || (name + ' Manager');
-  // V8: Create dedicated user account for this branch (manager auto-login).
-  // Data isolation via user_id which all APIs already enforce.
-  let branchUserId = null;
-  try {
-    const loginMobile = mgrMobile || ('br' + Date.now().toString(36));
-    const [ur] = await pool.execute(
-      "INSERT INTO users (name, mobile, role, business_name) VALUES (?, ?, 'staff', ?)",
-      [mgrName, loginMobile, name]
-    );
-    branchUserId = ur.insertId;
-  } catch (e) {
-    console.error('[createBranch] branch user failed:', e.message);
-  }
   const [r] = await pool.execute(
-    `INSERT INTO branches (owner_user_id, name, address, phone, manager_name, manager_mobile, access_token, token_active, branch_user_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+    `INSERT INTO branches (owner_user_id, name, address, phone, manager_name, manager_mobile, access_token, token_active)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
     [user.id, name,
      String(args.address || '').trim() || null,
      String(args.phone || '').trim() || null,
-     mgrName, mgrMobile, token, branchUserId]
+     String(args.manager_name || '').trim() || null,
+     String(args.manager_mobile || '').trim() || null,
+     token]
   );
   return { ok: true, branch_id: r.insertId, access_token: token,
            manager_link: '/branch.html?token=' + token };
@@ -1485,7 +1282,7 @@ async function hGetBranchByToken(req, args) {
     throw Object.assign(new Error('Invalid link'), { status: 400 });
   const [rows] = await pool.execute(
     `SELECT b.id, b.name, b.address, b.phone, b.manager_name, b.manager_mobile,
-            b.branch_user_id, u.business_name AS owner_business
+            u.business_name AS owner_business
      FROM branches b JOIN users u ON u.id = b.owner_user_id
      WHERE b.access_token = ? AND b.token_active = 1`,
     [token]
@@ -1493,21 +1290,8 @@ async function hGetBranchByToken(req, args) {
   if (!rows.length)
     throw Object.assign(new Error('This link is expired or invalid. Ask the owner for a new link.'), { status: 403 });
   const b = rows[0];
-  // V8: Auto-login session for branch user -> manager gets FULL app locked to branch.
-  let bst = null;
-  if (b.branch_user_id) {
-    try {
-      bst = crypto.randomBytes(32).toString('hex');
-      const exp = new Date(Date.now() + 365*24*3600*1000);
-      await pool.execute(
-        "INSERT INTO sessions (user_id, token_hash, expires_at) VALUES (?, ?, ?)",
-        [b.branch_user_id, crypto.createHash('sha256').update(bst).digest('hex'), exp]
-      );
-    } catch (e) { console.error('[branchToken] session failed:', e.message); bst = null; }
-  }
   return { ok: true, branch: { id: b.id, name: b.name, address: b.address,
-    phone: b.phone, manager_name: b.manager_name, owner_business: b.owner_business },
-    session_token: bst, branch_user_id: b.branch_user_id || null };
+    phone: b.phone, manager_name: b.manager_name, owner_business: b.owner_business } };
 }
 
 async function hListPosAdvance(req, args) {
@@ -1635,40 +1419,44 @@ async function hBranchCollections(req, args) {
   return { ok: true, branches: out, grand: grand, period: period, start_date: startDate, end_date: endDate };
 }
 
-// V8: Owner sees LIVE hisab of every branch + grand total.
-// Each branch has its own user account (branch_user_id); bills live under it.
 async function hGetAllBranchesHisab(req, args) {
   const { user } = needAuth(await authUser(req));
   const pool = getPool();
-  const [branches] = await pool.execute(
-    'SELECT id, name, manager_name, branch_user_id FROM branches WHERE owner_user_id = ? ORDER BY name',
-    [user.id]
-  ).catch(() => [[]]);
-  const out = [];
-  let gSales = 0, gBills = 0, gPaid = 0, gDue = 0;
-  for (const b of branches) {
-    let sales = 0, bills = 0, paid = 0, due = 0;
-    if (b.branch_user_id) {
-      try {
+  try {
+    const [branches] = await pool.execute(
+      'SELECT id, name, manager_name FROM branches WHERE owner_user_id = ? ORDER BY name',
+      [user.id]
+    );
+    // Check if bills.branch_id exists (added by migration; NULL = head/main branch)
+    let hasBranchCol = false;
+    try {
+      const [col] = await pool.execute(
+        "SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'bills' AND COLUMN_NAME = 'branch_id' LIMIT 1"
+      );
+      hasBranchCol = col.length > 0;
+    } catch (_) { hasBranchCol = false; }
+    const out = [];
+    const grand = { bills: 0, sales: 0, paid: 0, due: 0 };
+    for (const b of branches) {
+      let bills = 0, sales = 0, paid = 0, due = 0;
+      if (hasBranchCol) {
         const [r] = await pool.execute(
-          `SELECT COUNT(*) AS cnt, COALESCE(SUM(total),0) AS sales,
-                  COALESCE(SUM(joma),0) AS paid,
-                  COALESCE(SUM(total - joma),0) AS due
-           FROM bills WHERE user_id = ?`,
-          [b.branch_user_id]
+          'SELECT COUNT(*) AS cnt, COALESCE(SUM(total),0) AS sales, COALESCE(SUM(joma),0) AS paid, COALESCE(SUM(baki),0) AS due FROM bills WHERE user_id = ? AND branch_id = ?',
+          [user.id, b.id]
         );
         bills = r[0].cnt || 0;
         sales = parseFloat(r[0].sales) || 0;
         paid = parseFloat(r[0].paid) || 0;
         due = parseFloat(r[0].due) || 0;
-      } catch (_) {}
+      }
+      grand.bills += bills; grand.sales += sales; grand.paid += paid; grand.due += due;
+      out.push({ id: b.id, name: b.name || '', manager_name: b.manager_name || '',
+                 bills: bills, sales: sales, paid: paid, due: due });
     }
-    gSales += sales; gBills += bills; gPaid += paid; gDue += due;
-    out.push({ id: b.id, name: b.name, manager_name: b.manager_name,
-      bills: bills, sales: sales, paid: paid, due: due });
+    return { ok: true, branches: out, grand: grand };
+  } catch (err) {
+    return { ok: true, branches: [], grand: { bills: 0, sales: 0, paid: 0, due: 0 }, _note: 'hisab unavailable' };
   }
-  return { ok: true, branches: out,
-    grand: { bills: gBills, sales: gSales, paid: gPaid, due: gDue } };
 }
 
 async function hListPosSales(req, args) {
@@ -1926,9 +1714,7 @@ async function hGetMySubscription(req, args) {
     }
   }
   const hasMultiBranch = plan && plan.includes('branch');
-  // V7: owner bypass for the branch paywall (frontend branches.html checks sub.isOwner)
-  const isOwner = user.role === 'owner' || user.role === 'admin';
-  return { ok: true, isPremium, isTrial, trialDaysLeft, hasMultiBranch: !!hasMultiBranch, plan, isOwner };
+  return { ok: true, isPremium, isTrial, trialDaysLeft, hasMultiBranch: !!hasMultiBranch, plan };
 }
 
 async function hVerifySubscription(req, args) {
@@ -2177,8 +1963,6 @@ const DIRECT = {
   adminDashboard: hAdminDashboard,
   adminUserDetail: hAdminUserDetail,
   adminSubscriptions: hAdminSubscriptions,
-  getAdminActivityLog: hGetAdminActivityLog,
-  getLoginAlerts: hGetLoginAlerts,
   requestOwnerOtp: hRequestOwnerOtp,
   verifyOwnerOtp: hVerifyOwnerOtp,
   markBillPaid: hMarkBillPaid,
@@ -2271,12 +2055,12 @@ const DIRECT = {
   updateBranchManager: hUpdateBranchManager,
   deleteBranch: hDeleteBranch,
   getBranchByToken: hGetBranchByToken,
-  getAllBranchesHisab: hGetAllBranchesHisab,
   listPosAdvance: hListPosAdvance,
   addPosAdvance: hAddPosAdvance,
   markPosAttendance: hMarkPosAttendance,
   savePosStaff: hSavePosStaff,
   branchCollections: hBranchCollections,
+  getAllBranchesHisab: hGetAllBranchesHisab,
   listPosSales: hListPosSales,
   lookupPosOnlineOrder: hLookupPosOnlineOrder,
   getSeasonAnalytics: hGetSeasonAnalytics,
@@ -2362,89 +2146,6 @@ router.post('/', async (req, res, next) => {
     }
     return res.status(400).json({ error: `unknown action: ${action}` });
   } catch (e) { next(e); }
-});
-
-
-// ---------------------------------------------------------------------------
-// Razorpay webhook: server-to-server payment notifications.
-// Razorpay POSTs here on payment.captured / payment.failed.
-// URL in Razorpay dashboard: https://api.apumamart.com/api/actions/razorpay-webhook
-// Secret stored in env: RAZORPAY_WEBHOOK_SECRET
-// NOTE: uses express.raw() so signature verification gets the exact body.
-// ---------------------------------------------------------------------------
-router.post('/razorpay-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-  try {
-    const secret = process.env.RAZORPAY_WEBHOOK_SECRET || '';
-    if (!secret) {
-      console.error('[webhook] RAZORPAY_WEBHOOK_SECRET not set');
-      return res.status(500).json({ error: 'webhook not configured' });
-    }
-    const signature = req.headers['x-razorpay-signature'] || '';
-    const rawBody = req.body ? req.body.toString('utf8') : '';
-    const expected = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
-    const a = Buffer.from(expected, 'utf8');
-    const b = Buffer.from(String(signature), 'utf8');
-    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
-      console.error('[webhook] invalid signature');
-      return res.status(400).json({ error: 'invalid signature' });
-    }
-    let event;
-    try { event = JSON.parse(rawBody); }
-    catch (_) { return res.status(400).json({ error: 'bad json' }); }
-
-    const type = event.event || '';
-    const payment = (event.payload && event.payload.payment && event.payload.payment.entity) || {};
-    const orderId = String(payment.order_id || '');
-    const paymentId = String(payment.id || '');
-
-    if (type === 'payment.captured' && orderId) {
-      const pool = getPool();
-      const [o] = await pool.execute(
-        'SELECT id, user_id, plan_id, status FROM web_subscription_orders WHERE razorpay_order_id = ?',
-        [orderId]
-      ).catch(() => [[]]);
-      if (o.length && o[0].status !== 'paid') {
-        const plan = (typeof WEB_PLANS !== 'undefined' ? WEB_PLANS : {})[o[0].plan_id];
-        await pool.execute(
-          `UPDATE web_subscription_orders SET razorpay_payment_id = ?, status = 'paid', paid_at = NOW() WHERE id = ?`,
-          [paymentId, o[0].id]
-        ).catch(e => captureErr(e, { where: 'webhook-update-order' }));
-        // Activate subscription (same as hVerifyWebSubscription).
-        await pool.execute(
-          `INSERT INTO subscriptions (user_id, product_id, purchase_token, status) VALUES (?,?,?, 'verified')`,
-          [o[0].user_id, o[0].plan_id, paymentId]
-        ).catch(e => captureErr(e, { where: 'webhook-subscriptions' }));
-        if (plan) {
-          const expires = new Date();
-          expires.setMonth(expires.getMonth() + (plan.months || 1));
-          await pool.execute(
-            `INSERT INTO user_subscriptions (user_id, tier, plan_id, expires_at)
-             VALUES (?,?,?,?)
-             ON DUPLICATE KEY UPDATE tier = VALUES(tier), plan_id = VALUES(plan_id),
-               expires_at = VALUES(expires_at), updated_at = NOW()`,
-            [o[0].user_id, plan.tier, o[0].plan_id, expires]
-          ).catch(e => captureErr(e, { where: 'webhook-user-subscriptions' }));
-        }
-        console.log('[webhook] payment.captured -> order paid:', orderId);
-      } else {
-        console.log('[webhook] payment.captured ignored (order missing/already paid):', orderId);
-      }
-    } else if (type === 'payment.failed' && orderId) {
-      const pool = getPool();
-      await pool.execute(
-        `UPDATE web_subscription_orders SET status = 'failed' WHERE razorpay_order_id = ? AND status != 'paid'`,
-        [orderId]
-      ).catch(e => captureErr(e, { where: 'webhook-failed' }));
-      console.log('[webhook] payment.failed:', orderId);
-    } else {
-      console.log('[webhook] ignored event:', type);
-    }
-    return res.json({ ok: true });
-  } catch (e) {
-    captureErr(e, { where: 'razorpay-webhook' });
-    console.error('[webhook] error:', e.message);
-    return res.status(500).json({ error: 'webhook error' });
-  }
 });
 
 module.exports = router;
