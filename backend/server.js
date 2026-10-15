@@ -9,7 +9,7 @@
 // - Exit on untrusted errors (let Railway restart)
 const express = require('express');
 const crypto = require('crypto');
-const { initDb, getPool } = require('./db');
+const { initDb, getPoolIfReady } = require('./db');
 
 const app = express();
 
@@ -101,7 +101,7 @@ async function gracefulShutdown(signal) {
 
   // Close DB pool
   try {
-    const pool = getPool();
+    const pool = getPoolIfReady();
     if (pool) {
       await pool.end();
       log('info', 'database pool closed');
