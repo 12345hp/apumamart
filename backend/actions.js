@@ -359,6 +359,76 @@ function msg91Get(path) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Security pack (2026-10-15): OTP brute-force lock, login alerts, activity log
+// - 5 failed OTP attempts → 15 minute lock per mobile
+// - Every successful owner/admin login is logged (login_alerts + activity log)
+// - Admin actions logged via logActivity()
+// ---------------------------------------------------------------------------
+const OTP_MAX_ATTEMPTS = 5;
+const OTP_LOCK_MINUTES = 15;
+
+async function checkOtpLock(pool, mobile) {
+  try {
+    const [rows] = await pool.execute(
+      'SELECT attempts, locked_until FROM otp_attempts WHERE mobile = ?', [mobile]
+    );
+    const r = rows[0];
+    if (r && r.locked_until && new Date(r.locked_until) > new Date()) {
+      const mins = Math.ceil((new Date(r.locked_until) - new Date()) / 60000);
+      const e = new Error(`bahut galat OTP! ${mins} minute ruko phir try karo.`);
+      e.status = 429;
+      throw e;
+    }
+  } catch (e) { if (e.status === 429) throw e; /* table may not exist yet */ }
+}
+
+async function recordOtpFailure(pool, mobile) {
+  try {
+    await pool.execute(
+      `INSERT INTO otp_attempts (mobile, attempts, locked_until) VALUES (?, 1, NULL)
+       ON DUPLICATE KEY UPDATE attempts = attempts + 1, last_attempt_at = NOW()`,
+      [mobile]
+    );
+    const [rows] = await pool.execute('SELECT attempts FROM otp_attempts WHERE mobile = ?', [mobile]);
+    if (rows[0] && rows[0].attempts >= OTP_MAX_ATTEMPTS) {
+      await pool.execute(
+        'UPDATE otp_attempts SET locked_until = DATE_ADD(NOW(), INTERVAL ? MINUTE), attempts = 0 WHERE mobile = ?',
+        [OTP_LOCK_MINUTES, mobile]
+      );
+      const e = new Error(`5 galat OTP! ${OTP_LOCK_MINUTES} minute ke liye lock.`);
+      e.status = 429;
+      throw e;
+    }
+  } catch (e) { if (e.status === 429) throw e; /* ignore */ }
+}
+
+async function clearOtpAttempts(pool, mobile) {
+  try { await pool.execute('DELETE FROM otp_attempts WHERE mobile = ?', [mobile]); } catch (_) {}
+}
+
+async function logActivity(pool, userId, mobile, action, details, req) {
+  try {
+    const ip = (req && (req.headers['x-forwarded-for'] || req.ip || req.connection?.remoteAddress) || '').toString().slice(0, 45);
+    await pool.execute(
+      'INSERT INTO admin_activity_log (user_id, mobile, action, details, ip) VALUES (?, ?, ?, ?, ?)',
+      [userId || null, mobile || null, action, details ? String(details).slice(0, 2000) : null, ip || null]
+    );
+  } catch (_) { /* never break the request for logging */ }
+}
+
+async function logLoginAlert(pool, user, req) {
+  try {
+    const ip = (req && (req.headers['x-forwarded-for'] || req.ip || req.connection?.remoteAddress) || '').toString().slice(0, 45);
+    const ua = (req && req.headers['user-agent'] || '').toString().slice(0, 255);
+    await pool.execute(
+      'INSERT INTO login_alerts (user_id, mobile, ip, user_agent) VALUES (?, ?, ?, ?)',
+      [user.id, user.mobile, ip || null, ua || null]
+    );
+    await logActivity(pool, user.id, user.mobile, 'login', `role=${user.role} ip=${ip}`, req);
+  } catch (_) {}
+}
+
 async function hRequestOwnerOtp(req, args) {
   const mobile = String(args.mobile || '').replace(/\D/g, '').slice(-10);
   if (mobile.length !== 10) { const e = new Error('10 digit mobile required'); e.status = 400; throw e; }
@@ -372,7 +442,9 @@ async function hRequestOwnerOtp(req, args) {
     user = u2[0];
   }
   if (!user) { const e = new Error('sirf owner/admin OTP login kar sakte hain'); e.status = 403; throw e; }
-  const result = await msg91Get(`/api/v5/otp?mobile=91${mobile}`);
+  const dltTemplate = process.env.MSG91_DLT_TEMPLATE_ID || '';
+  const otpPath = `/api/v5/otp?mobile=91${mobile}` + (dltTemplate ? `&template_id=${encodeURIComponent(dltTemplate)}` : '');
+  const result = await msg91Get(otpPath);
   if (result && result.type === 'success') {
     return { ok: true, message: 'OTP bheja gaya!' };
   }
@@ -383,10 +455,17 @@ async function hVerifyOwnerOtp(req, args) {
   const mobile = String(args.mobile || '').replace(/\D/g, '').slice(-10);
   const otp = String(args.otp || '').trim();
   if (mobile.length !== 10 || !otp) { const e = new Error('mobile aur otp required'); e.status = 400; throw e; }
+  const pool = getPool();
+  // Security: 5 failed attempts → 15 min lock
+  await checkOtpLock(pool, mobile);
   const result = await msg91Get(`/api/v5/otp/verify?mobile=91${mobile}&otp=${encodeURIComponent(otp)}`);
   const verified = result && (result.type === 'success' || result.message === 'OTP verified successfully.');
-  if (!verified) { const e = new Error('galat OTP!'); e.status = 400; throw e; }
-  const pool = getPool();
+  if (!verified) {
+    await recordOtpFailure(pool, mobile);
+    await logActivity(pool, null, mobile, 'otp_failed', 'galat OTP', req);
+    const e = new Error('galat OTP!'); e.status = 400; throw e;
+  }
+  await clearOtpAttempts(pool, mobile);
   const [u] = await pool.execute("SELECT * FROM users WHERE (mobile = ? OR mobile = ? OR mobile = ?) AND role IN ('owner','admin')", [mobile, '91'+mobile, '0'+mobile]);
   const user = u[0];
   if (!user) { const e = new Error('user not found'); e.status = 404; throw e; }
@@ -395,6 +474,8 @@ async function hVerifyOwnerOtp(req, args) {
   const token = crypto.randomBytes(32).toString('hex');
   const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
   await pool.execute('INSERT INTO sessions (user_id, token_hash, expires_at) VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 30 DAY))', [user.id, tokenHash]);
+  // Security: login alert + activity log
+  await logLoginAlert(pool, user, req);
   return { ok: true, account: { session_token: token, user: pubUser(user) } };
 }
 
@@ -491,6 +572,31 @@ async function hAdminUserDetail(req, args) {
   const [branches] = await pool.execute('SELECT id, name, manager_name, manager_mobile, created_at FROM branches WHERE owner_user_id = ?', [userId]).catch(() => [[]]);
   const [sess] = await pool.execute('SELECT MAX(last_seen_at) AS last_seen FROM sessions WHERE user_id = ?', [userId]).catch(() => [[{}]]);
   return { ok: true, user: u[0], subscription: subs[0] || null, orders, branches, last_seen: (sess[0] || {}).last_seen || null };
+}
+
+// Security pack: owner views admin activity log + login alerts
+async function hGetAdminActivityLog(req, args) {
+  const { user } = needAuth(await authUser(req));
+  needOwner(user);
+  const pool = getPool();
+  const limit = Math.min(Number(args.limit) || 50, 200);
+  const [logs] = await pool.execute(
+    'SELECT id, user_id, mobile, action, details, ip, created_at FROM admin_activity_log ORDER BY id DESC LIMIT ?',
+    [String(limit)]
+  ).catch(() => [[]]);
+  return { ok: true, logs: logs || [] };
+}
+
+async function hGetLoginAlerts(req, args) {
+  const { user } = needAuth(await authUser(req));
+  needOwner(user);
+  const pool = getPool();
+  const limit = Math.min(Number(args.limit) || 50, 200);
+  const [alerts] = await pool.execute(
+    'SELECT id, user_id, mobile, ip, user_agent, created_at FROM login_alerts ORDER BY id DESC LIMIT ?',
+    [String(limit)]
+  ).catch(() => [[]]);
+  return { ok: true, alerts: alerts || [] };
 }
 
 async function hAdminSubscriptions(req, args) {
@@ -2071,6 +2177,8 @@ const DIRECT = {
   adminDashboard: hAdminDashboard,
   adminUserDetail: hAdminUserDetail,
   adminSubscriptions: hAdminSubscriptions,
+  getAdminActivityLog: hGetAdminActivityLog,
+  getLoginAlerts: hGetLoginAlerts,
   requestOwnerOtp: hRequestOwnerOtp,
   verifyOwnerOtp: hVerifyOwnerOtp,
   markBillPaid: hMarkBillPaid,
