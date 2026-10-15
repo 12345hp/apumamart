@@ -12,8 +12,8 @@ const express = require('express');
 const http = require('http');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
-const { getPool, isReady } = require('../db');
-const { normMobile, pubUser, num } = require('../util');
+const { getPool, isReady } = require('./db');
+const { normMobile, pubUser, num } = require('./util');
 
 const router = express.Router();
 
@@ -278,7 +278,12 @@ async function hRequestOwnerOtp(req, args) {
   const dltTemplate = process.env.MSG91_DLT_TEMPLATE_ID || '';
   let otpPath = `/api/v5/otp?mobile=91${mobile}&otp=${otp}`;
   if (dltTemplate) otpPath += `&template_id=${encodeURIComponent(dltTemplate)}`;
-  const result = await msg91Get(otpPath);
+  let result;
+  try {
+    result = await msg91Get(otpPath);
+  } catch (msgErr) {
+    return { ok: false, error: 'SMS bhejne mein fail: ' + (msgErr.message || 'network error') };
+  }
   if (result && result.type === 'success') {
     return { ok: true, message: 'OTP bheja gaya!' };
   }

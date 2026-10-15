@@ -7,7 +7,16 @@ let pool = null;
 let ready = false;
 let lastError = null;
 
-function getPool() { return pool; }
+function getPool() {
+  if (!pool) {
+    const err = new Error('Database not connected' + (lastError ? ': ' + lastError : ''));
+    err.code = 'DB_NOT_CONNECTED';
+    throw err;
+  }
+  return pool;
+}
+// Unsafe accessor for shutdown paths that must not throw.
+function getPoolIfReady() { return pool; }
 function isReady() { return ready; }
 function dbError() { return lastError; }
 
@@ -349,6 +358,41 @@ const SCHEMA = [
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   INDEX idx_onlineorders_user (user_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+// Security pack (2026-10-15): OTP brute-force lock + admin activity log + login alerts
+`CREATE TABLE IF NOT EXISTS otp_attempts (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  mobile VARCHAR(20) NOT NULL,
+  attempts INT NOT NULL DEFAULT 0,
+  locked_until TIMESTAMP NULL,
+  last_attempt_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_otp_mobile (mobile),
+  INDEX idx_otp_locked (locked_until)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+`CREATE TABLE IF NOT EXISTS admin_activity_log (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NULL,
+  mobile VARCHAR(20) NULL,
+  action VARCHAR(100) NOT NULL,
+  details TEXT NULL,
+  ip VARCHAR(45) NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_activity_user (user_id),
+  INDEX idx_activity_action (action),
+  INDEX idx_activity_created (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+`CREATE TABLE IF NOT EXISTS login_alerts (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  mobile VARCHAR(20) NOT NULL,
+  ip VARCHAR(45) NULL,
+  user_agent VARCHAR(255) NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_loginalert_user (user_id),
+  INDEX idx_loginalert_created (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 ];
 
 // Add columns to bills that didn't exist in the original schema.
@@ -524,4 +568,4 @@ async function initDb() {
   }
 }
 
-module.exports = { initDb, getPool, isReady, dbError };
+module.exports = { initDb, getPool, getPoolIfReady, isReady, dbError };
