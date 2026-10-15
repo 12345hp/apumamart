@@ -7,7 +7,16 @@ let pool = null;
 let ready = false;
 let lastError = null;
 
-function getPool() { return pool; }
+function getPool() {
+  if (!pool) {
+    const err = new Error('Database not connected' + (lastError ? ': ' + lastError : ''));
+    err.code = 'DB_NOT_CONNECTED';
+    throw err;
+  }
+  return pool;
+}
+// Unsafe accessor for shutdown paths that must not throw.
+function getPoolIfReady() { return pool; }
 function isReady() { return ready; }
 function dbError() { return lastError; }
 
@@ -524,4 +533,4 @@ async function initDb() {
   }
 }
 
-module.exports = { initDb, getPool, isReady, dbError };
+module.exports = { initDb, getPool, getPoolIfReady, isReady, dbError };
