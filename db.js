@@ -359,6 +359,28 @@ const SCHEMA = [
   INDEX idx_onlineorders_user (user_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 
+// Delivery slots + OTP (2026-10-19): real tables for delivery.html standalone page
+`CREATE TABLE IF NOT EXISTS pos_delivery_slots (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  name VARCHAR(100) NOT NULL,
+  slot_time VARCHAR(50) NULL,
+  is_active TINYINT(1) NOT NULL DEFAULT 1,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_deliveryslots_user (user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+`CREATE TABLE IF NOT EXISTS pos_delivery_otps (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  order_id INT NOT NULL,
+  otp_hash VARCHAR(255) NOT NULL,
+  expires_at TIMESTAMP NOT NULL,
+  verified TINYINT(1) NOT NULL DEFAULT 0,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_deliveryotps_user_order (user_id, order_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
 // Security pack (2026-10-15): OTP brute-force lock + admin activity log + login alerts
 `CREATE TABLE IF NOT EXISTS otp_attempts (
   id INT AUTO_INCREMENT PRIMARY KEY,
