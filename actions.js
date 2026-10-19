@@ -806,7 +806,21 @@ async function hDeleteCustomerDataDirect(req, args) {
 }
 async function hAddPosSupplierDirect(req, args) {
   const { user } = needAuth(await authUser(req));
-  return { ok: true, saved: true };
+  const pool = getPool();
+  const name = String(args.name || args.supplier_name || '').trim().slice(0, 100);
+  if (!name) { const e = new Error('supplier name required'); e.status = 400; throw e; }
+  const mobile = args.mobile ? String(args.mobile).replace(/\D/g, '').slice(-10) : null;
+  // Duplicate rokne ke liye: same naam ka supplier pehle se hai to wahi return karo
+  const [existing] = await pool.execute(
+    'SELECT id, name, mobile FROM suppliers WHERE user_id = ? AND name = ? LIMIT 1',
+    [user.id, name]
+  ).catch(() => [[]]);
+  if (existing.length) return { ok: true, saved: true, id: existing[0].id, supplier: existing[0] };
+  const [r] = await pool.execute(
+    'INSERT INTO suppliers (user_id, name, mobile) VALUES (?, ?, ?)',
+    [user.id, name, mobile]
+  );
+  return { ok: true, saved: true, id: r.insertId, supplier: { id: r.insertId, name, mobile } };
 }
 async function hAddSupplierKhataEntryDirect(req, args) {
   const { user } = needAuth(await authUser(req));
@@ -863,7 +877,16 @@ async function hImportPosProductsDirect(req, args) {
 }
 async function hAddPosExpenseDirect(req, args) {
   const { user } = needAuth(await authUser(req));
-  return { ok: true, saved: true };
+  const pool = getPool();
+  const amount = Number(args.amount);
+  if (!Number.isFinite(amount) || amount <= 0) { const e = new Error('valid amount required'); e.status = 400; throw e; }
+  const category = String(args.category || 'other').slice(0, 80);
+  const note = args.note ? String(args.note).slice(0, 255) : (args.title ? String(args.title).slice(0, 255) : null);
+  const [r] = await pool.execute(
+    'INSERT INTO expenses (user_id, amount, category, note) VALUES (?, ?, ?, ?)',
+    [user.id, amount, category, note]
+  );
+  return { ok: true, saved: true, id: r.insertId };
 }
 async function hAddPosMemberDirect(req, args) {
   const { user } = needAuth(await authUser(req));
@@ -969,7 +992,20 @@ async function hClearPosCounterCart(req, args) {
 
 async function hCreatePosDeliverySlot(req, args) {
   const { user } = needAuth(await authUser(req));
-  return { ok: true, saved: true, id: null };
+  const pool = getPool();
+  const name = String(args.name || '').trim().slice(0, 100);
+  if (!name) { const e = new Error('slot name required'); e.status = 400; throw e; }
+  const slot_time = args.time ? String(args.time).slice(0, 50) : (args.slot_time ? String(args.slot_time).slice(0, 50) : null);
+  const [r] = await pool.execute(
+    'INSERT INTO pos_delivery_slots (user_id, name, slot_time) VALUES (?, ?, ?)',
+    [user.id, name, slot_time]
+  ).catch(() => [{ insertId: null }]);
+  // Slots ki list bhi bhej do taaki page turant update ho jaye
+  const [rows] = await pool.execute(
+    'SELECT id, name, slot_time, is_active, created_at FROM pos_delivery_slots WHERE user_id = ? AND is_active = 1 ORDER BY created_at DESC LIMIT 100',
+    [user.id]
+  ).catch(() => [[]]);
+  return { ok: true, saved: true, id: r.insertId || null, slots: rows, items: rows };
 }
 
 async function hCreatePosGiftCard(req, args) {
@@ -1107,7 +1143,17 @@ async function hUpdatePosOnlineOrder(req, args) {
   try {
     const status = String(args.status || 'pending').slice(0, 20);
     if (args.id) await pool.execute('UPDATE pos_online_orders SET status=? WHERE id=? AND user_id=?', [status, args.id, user.id]).catch(() => null);
-    return { ok: true, updated: true, orders: [], items: [] };
+    // Order "out for delivery" hote hi 6-digit OTP banao (10 min valid)
+    let delivery_otp = null;
+    if (args.id && status === 'out_for_delivery') {
+      delivery_otp = String(Math.floor(100000 + Math.random() * 900000));
+      const hash = crypto.createHash('sha256').update(delivery_otp).digest('hex');
+      await pool.execute(
+        'INSERT INTO pos_delivery_otps (user_id, order_id, otp_hash, expires_at) VALUES (?, ?, ?, DATE_ADD(NOW(), INTERVAL 10 MINUTE))',
+        [user.id, args.id, hash]
+      ).catch(() => null);
+    }
+    return { ok: true, updated: true, orders: [], items: [], delivery_otp };
   } catch (_) { return { ok: true, updated: true, orders: [], items: [] }; }
 }
 
@@ -1128,6 +1174,26 @@ async function hUploadPosProductImage(req, args) {
 
 async function hVerifyPosDeliveryOtp(req, args) {
   const { user } = needAuth(await authUser(req));
+  const pool = getPool();
+  const order_id = Number(args.order_id || args.orderId);
+  const otp = String(args.otp || '').replace(/\D/g, '').slice(0, 6);
+  if (!Number.isFinite(order_id) || !otp) { const e = new Error('order_id aur otp dono chahiye'); e.status = 400; throw e; }
+  // Order user ka hi hona chahiye
+  const [ord] = await pool.execute(
+    'SELECT id FROM pos_online_orders WHERE id = ? AND user_id = ? LIMIT 1',
+    [order_id, user.id]
+  ).catch(() => [[]]);
+  if (!ord.length) return { ok: false, error: 'order nahi mila' };
+  // Valid (non-expired, non-verified) OTP dhoondo
+  const [rows] = await pool.execute(
+    'SELECT id, otp_hash FROM pos_delivery_otps WHERE user_id = ? AND order_id = ? AND verified = 0 AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1',
+    [user.id, order_id]
+  ).catch(() => [[]]);
+  if (!rows.length) return { ok: false, error: 'OTP expired ya generate nahi hua — order ko "out for delivery" karo' };
+  const hash = crypto.createHash('sha256').update(otp).digest('hex');
+  if (hash !== rows[0].otp_hash) return { ok: false, error: 'OTP galat hai' };
+  await pool.execute('UPDATE pos_delivery_otps SET verified = 1 WHERE id = ?', [rows[0].id]).catch(() => null);
+  await pool.execute("UPDATE pos_online_orders SET status = 'delivered' WHERE id = ? AND user_id = ?", [order_id, user.id]).catch(() => null);
   return { ok: true, verified: true };
 }
 
@@ -1194,7 +1260,16 @@ async function hAddPosExpenseDirect(req, args) {
 
 async function hGetPosDeliveryCommerce(req, args) {
   const { user } = needAuth(await authUser(req));
-  return { ok: true, slots: [], orders: [] };
+  const pool = getPool();
+  const [slots] = await pool.execute(
+    'SELECT id, name, slot_time, is_active, created_at FROM pos_delivery_slots WHERE user_id = ? AND is_active = 1 ORDER BY created_at DESC LIMIT 100',
+    [user.id]
+  ).catch(() => [[]]);
+  const [orders] = await pool.execute(
+    "SELECT id, customer_name, phone, total, status, created_at FROM pos_online_orders WHERE user_id = ? AND status IN ('confirmed','out_for_delivery','pending') ORDER BY created_at DESC LIMIT 100",
+    [user.id]
+  ).catch(() => [[]]);
+  return { ok: true, slots: Array.isArray(slots) ? slots : [], orders: Array.isArray(orders) ? orders : [], items: Array.isArray(slots) ? slots : [] };
 }
 
 async function hGetPosFraudDashboard(req, args) {
