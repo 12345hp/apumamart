@@ -514,7 +514,7 @@ app.post('/api/auth/otp/request', async (req, res) => {
       [mobile, '91' + mobile, '0' + mobile]
     );
     if (!u[0]) return res.status(403).json({ ok: false, error: 'sirf owner/admin OTP login kar sakte hain' });
-    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    const otp = String(Math.floor(1000 + Math.random() * 9000));
     const otpHash = crypto.createHash('sha256').update(otp).digest('hex');
     const expiresAt = Date.now() + 5 * 60 * 1000;
     try {
@@ -619,7 +619,11 @@ if (actionsRouter) {
 // Centralized error handler (must be last)
 app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
   log('error', 'unhandled request error', { reqId: req.id, error: err.message, stack: err.stack });
-  if (!res.headersSent) res.status(500).json({ ok: false, error: 'Internal server error' });
+  if (!res.headersSent) {
+    const status = err.status || 500;
+    const message = status >= 500 ? 'Internal server error' : err.message;
+    res.status(status).json({ ok: false, error: message });
+  }
 });
 
 // ---------------------------------------------------------------------------
