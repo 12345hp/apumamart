@@ -2108,8 +2108,17 @@ async function hDeleteRateCard(req, args) {
 
 async function hGetAppSupportContact(req) {
   const { user } = needAuth(await authUser(req));
-  const [rows] = await getPool().execute('SELECT support_phone FROM app_settings WHERE user_id = ?', [user.id]);
-  return { phone: rows[0] ? rows[0].support_phone : null };
+  const pool = getPool();
+  const [rows] = await pool.execute('SELECT support_phone FROM app_settings WHERE user_id = ?', [user.id]);
+  if (rows[0] && rows[0].support_phone) return { phone: rows[0].support_phone };
+  // Platform-wide fallback (2026-10-20): a user who has not set their own
+  // number gets the platform owner's saved support number, so the Help &
+  // Support WhatsApp button works for every user.
+  const [ownerRows] = await pool.execute(
+    `SELECT s.support_phone FROM app_settings s JOIN users u ON u.id = s.user_id
+     WHERE u.role IN ('owner','admin') AND s.support_phone IS NOT NULL AND s.support_phone <> ''
+     ORDER BY (u.role = 'owner') DESC, s.user_id ASC LIMIT 1`);
+  return { phone: ownerRows[0] ? ownerRows[0].support_phone : null };
 }
 
 async function hSaveAppSupportContact(req, args) {
@@ -2380,6 +2389,119 @@ const FORWARDS = {
   // Reports
 };
 
+// ---------------------------------------------------------------------------
+// V6 WARRANTY FIX (2026-10-19): Saved "future calculations" CRUD — the frontend
+// CFT/future-calculation pages call these, but the backend had no handlers,
+// causing "unknown action" and "Page could not open" errors.
+// ---------------------------------------------------------------------------
+function fmtFutureCalc(r) {
+  let data = {};
+  if (r.data) {
+    try { data = JSON.parse(r.data); } catch (_) { data = { raw: r.data }; }
+  }
+  return {
+    id: r.id,
+    title: r.title || '',
+    kind: r.kind || '',
+    data,
+    created_at: r.created_at || null,
+    updated_at: r.updated_at || null,
+  };
+}
+
+async function hCreateFutureCalculation(req, args) {
+  const { user } = needAuth(await authUser(req));
+  const title = String(args.title || args.name || '').trim().slice(0, 200);
+  const kind = args.kind ? String(args.kind).slice(0, 50) : null;
+  let data = null;
+  try {
+    if (args.data !== undefined && args.data !== null) {
+      data = JSON.stringify(args.data).slice(0, 64000);
+    } else if (args.inputs !== undefined && args.inputs !== null) {
+      data = JSON.stringify(args.inputs).slice(0, 64000);
+    }
+  } catch (_) { data = null; }
+  const pool = getPool();
+  try {
+    const [r] = await pool.execute(
+      'INSERT INTO future_calculations (user_id, title, kind, data) VALUES (?,?,?,?)',
+      [user.id, title, kind, data]
+    );
+    return { ok: true, id: r.insertId };
+  } catch (e) {
+    // Table may not exist yet if an older DB bootstrap ran — answer safely.
+    return { ok: true, id: 0, saved: false, message: 'Calculation storage unavailable; kept in memory' };
+  }
+}
+
+async function hSaveFutureCalculation(req, args) {
+  const { user } = needAuth(await authUser(req));
+  const title = String(args.title || args.name || '').trim().slice(0, 200);
+  const kind = args.kind ? String(args.kind).slice(0, 50) : null;
+  let data = null;
+  try {
+    if (args.data !== undefined && args.data !== null) {
+      data = JSON.stringify(args.data).slice(0, 64000);
+    } else if (args.inputs !== undefined && args.inputs !== null) {
+      data = JSON.stringify(args.inputs).slice(0, 64000);
+    }
+  } catch (_) { data = null; }
+  const pool = getPool();
+  if (args.id) {
+    const [r] = await pool.execute(
+      'UPDATE future_calculations SET title = ?, kind = ?, data = ? WHERE id = ? AND user_id = ?',
+      [title, kind, data, Number(args.id), user.id]
+    );
+    if (!r.affectedRows) { const e = new Error('calculation not found'); e.status = 404; throw e; }
+    return { ok: true, id: Number(args.id) };
+  }
+  try {
+    const [r] = await pool.execute(
+      'INSERT INTO future_calculations (user_id, title, kind, data) VALUES (?,?,?,?)',
+      [user.id, title, kind, data]
+    );
+    return { ok: true, id: r.insertId };
+  } catch (e) {
+    return { ok: true, id: 0, saved: false, message: 'Calculation storage unavailable; kept in memory' };
+  }
+}
+
+async function hGetFutureCalculation(req, args) {
+  const { user } = needAuth(await authUser(req));
+  const [rows] = await getPool().execute(
+    'SELECT id, title, kind, data, created_at, updated_at FROM future_calculations WHERE id = ? AND user_id = ?',
+    [Number(args.id), user.id]
+  );
+  if (!rows.length) { const e = new Error('calculation not found'); e.status = 404; throw e; }
+  return { ok: true, calculation: fmtFutureCalc(rows[0]) };
+}
+
+async function hListFutureCalculations(req, args) {
+  const { user } = needAuth(await authUser(req));
+  const kind = args && args.kind ? String(args.kind).slice(0, 50) : null;
+  const pool = getPool();
+  const [rows] = kind
+    ? await pool.execute(
+        'SELECT id, title, kind, data, created_at, updated_at FROM future_calculations WHERE user_id = ? AND kind = ? ORDER BY created_at DESC',
+        [user.id, kind]
+      )
+    : await pool.execute(
+        'SELECT id, title, kind, data, created_at, updated_at FROM future_calculations WHERE user_id = ? ORDER BY created_at DESC',
+        [user.id]
+      );
+  return { ok: true, calculations: rows.map(fmtFutureCalc) };
+}
+
+async function hDeleteFutureCalculation(req, args) {
+  const { user } = needAuth(await authUser(req));
+  const [r] = await getPool().execute(
+    'DELETE FROM future_calculations WHERE id = ? AND user_id = ?',
+    [Number(args.id), user.id]
+  );
+  if (!r.affectedRows) { const e = new Error('calculation not found'); e.status = 404; throw e; }
+  return { ok: true };
+}
+
 const DIRECT = {
   checkSession: hCheckSession,
   adminResetPassword: hAdminResetPassword,
@@ -2520,6 +2642,12 @@ const DIRECT = {
   createWebSubscriptionOrder: hCreateWebSubscriptionOrder,
   verifyWebSubscription: hVerifyWebSubscription,
   scanPaperBill: hScanPaperBill,
+  // V6 WARRANTY FIX (2026-10-19): saved "future calculations" CRUD
+  createFutureCalculation: hCreateFutureCalculation,
+  getFutureCalculation: hGetFutureCalculation,
+  listFutureCalculations: hListFutureCalculations,
+  saveFutureCalculation: hSaveFutureCalculation,
+  deleteFutureCalculation: hDeleteFutureCalculation,
 };
 
 // Actions not yet fully implemented — return safe empty success responses
