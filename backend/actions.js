@@ -645,8 +645,18 @@ async function hGetPosCounters(req, args) {
 
 async function hListPosDayCloses(req, args) {
   const { user } = needAuth(await authUser(req));
-  // Frontend expects data.closes (Zy.data?.closes.map)
-  return { ok: true, items: [], day_closes: [], closes: [], total: 0 };
+  // REAL (v5): day_closes table se asal list
+  const pool = getPool();
+  const limit = Math.min(parseInt(args.limit, 10) || 30, 100);
+  try {
+    const [rows] = await pool.execute(
+      'SELECT id, counter_id, date, expected_cash, actual_cash, note, created_at FROM day_closes WHERE user_id = ? ORDER BY date DESC, id DESC LIMIT ' + limit,
+      [user.id]
+    );
+    return { ok: true, items: rows, day_closes: rows, closes: rows, total: rows.length };
+  } catch (_) {
+    return { ok: true, items: [], day_closes: [], closes: [], total: 0 };
+  }
 }
 
 async function hListPosCoupons(req, args) {
@@ -873,7 +883,27 @@ async function hAdjustPosProductStockDirect(req, args) {
 }
 async function hImportPosProductsDirect(req, args) {
   const { user } = needAuth(await authUser(req));
-  return { ok: true, imported: 0 };
+  // REAL (v5): CSV se aaye products asal mein products table mein save
+  const pool = getPool();
+  const rows = Array.isArray(args.products) ? args.products : (Array.isArray(args.rows) ? args.rows : (Array.isArray(args.items) ? args.items : []));
+  let imported = 0, skipped = 0;
+  for (const r of rows) {
+    const name = String((r && (r.name || r.product_name)) || '').trim().slice(0, 150);
+    if (!name) { skipped++; continue; }
+    const price = Number(r.price) || 0;
+    const barcode = r.barcode ? String(r.barcode).trim().slice(0, 60) : null;
+    const gst = Number(r.gst_percent != null ? r.gst_percent : (r.gst_pct != null ? r.gst_pct : 0)) || 0;
+    const stock = Number(r.stock_quantity != null ? r.stock_quantity : (r.stock != null ? r.stock : 0)) || 0;
+    const lowAt = Number(r.minimum_stock != null ? r.minimum_stock : (r.low_stock_at != null ? r.low_stock_at : 0)) || 0;
+    try {
+      await pool.execute(
+        'INSERT INTO products (user_id, name, barcode, price, gst_pct, stock, low_stock_at) VALUES (?,?,?,?,?,?,?)',
+        [user.id, name, barcode, price, gst, stock, lowAt]
+      );
+      imported++;
+    } catch (_) { skipped++; }
+  }
+  return { ok: true, imported, skipped, total: rows.length };
 }
 async function hAddPosExpenseDirect(req, args) {
   const { user } = needAuth(await authUser(req));
@@ -940,7 +970,34 @@ async function hConfigurePosCountersDirect(req, args) {
 }
 async function hClosePosDayDirect(req, args) {
   const { user } = needAuth(await authUser(req));
-  return { ok: true, closed: true };
+  // REAL (v5): din bhar ki bikri se expected cash hisab karke day_closes mein save
+  const pool = getPool();
+  const counterId = parseInt(args.counter_id, 10) || null;
+  const bdate = String(args.business_date || args.date || new Date().toISOString().slice(0, 10)).slice(0, 10);
+  const startMs = Number(args.day_start_ms) || 0;
+  const endMs = Number(args.day_end_ms) || 0;
+  const actualCash = Number(args.actual_cash) || 0;
+  let expected = 0;
+  try {
+    if (startMs && endMs) {
+      const [t] = await pool.execute(
+        'SELECT COALESCE(SUM(joma),0) AS s FROM bills WHERE user_id = ? AND created_at >= FROM_UNIXTIME(?) AND created_at < FROM_UNIXTIME(?)',
+        [user.id, Math.floor(startMs / 1000), Math.floor(endMs / 1000)]
+      );
+      expected = Number(t[0].s) || 0;
+    } else {
+      const [t] = await pool.execute(
+        'SELECT COALESCE(SUM(joma),0) AS s FROM bills WHERE user_id = ? AND DATE(created_at) = ?',
+        [user.id, bdate]
+      );
+      expected = Number(t[0].s) || 0;
+    }
+  } catch (_) { expected = 0; }
+  const [res] = await pool.execute(
+    'INSERT INTO day_closes (user_id, counter_id, date, expected_cash, actual_cash, note) VALUES (?,?,?,?,?,?)',
+    [user.id, counterId, bdate, expected, actualCash, args.note ? String(args.note).slice(0, 255) : null]
+  );
+  return { ok: true, closed: true, id: res.insertId, expected_cash: expected, actual_cash: actualCash, date: bdate };
 }
 async function hAskBusinessQuestionDirect(req, args) {
   const { user } = needAuth(await authUser(req));
@@ -1097,19 +1154,36 @@ async function hSavePosReminderLog(req, args) {
 
 async function hSavePosStaffDiscountRule(req, args) {
   const { user } = needAuth(await authUser(req));
+  // REAL (v5): table ab db.js mein banti hai — asal INSERT
   const pool = getPool();
-  try {
-    await pool.execute(
-      'INSERT INTO pos_staff_discount_rules (user_id, staff_name, staff_pin, max_discount_percent) VALUES (?,?,?,?) ON DUPLICATE KEY UPDATE max_discount_percent=VALUES(max_discount_percent)',
-      [user.id, String(args.staff_name || args.cashier_name || '').slice(0, 100), String(args.staff_pin || '').slice(0, 10), Number(args.max_discount_percent) || 0]
-    ).catch(() => null);
-    return { ok: true, saved: true };
-  } catch (_) { return { ok: true, saved: true }; }
+  const staffName = String(args.staff_name || args.cashier_name || '').slice(0, 100);
+  if (!staffName) { const e = new Error('staff_name required'); e.status = 400; throw e; }
+  await pool.execute(
+    'INSERT INTO pos_staff_discount_rules (user_id, staff_name, staff_pin, max_discount_percent) VALUES (?,?,?,?) ON DUPLICATE KEY UPDATE staff_pin=VALUES(staff_pin), max_discount_percent=VALUES(max_discount_percent)',
+    [user.id, staffName, String(args.staff_pin || '').slice(0, 10), Number(args.max_discount_percent) || 0]
+  );
+  return { ok: true, saved: true };
 }
 
 async function hSavePosUpiSettlement(req, args) {
   const { user } = needAuth(await authUser(req));
-  return { ok: true, saved: true, settlements: [], items: [] };
+  // REAL (v5): UPI settlement asal mein save + list wapas
+  const pool = getPool();
+  const bdate = String(args.business_date || args.date || new Date().toISOString().slice(0, 10)).slice(0, 10);
+  const amt = Number(args.bank_amount != null ? args.bank_amount : (args.amount || 0)) || 0;
+  const [res] = await pool.execute(
+    'INSERT INTO pos_upi_settlements (user_id, business_date, bank_amount, note) VALUES (?,?,?,?)',
+    [user.id, bdate, amt, args.note ? String(args.note).slice(0, 255) : null]
+  );
+  let rows = [];
+  try {
+    const [r] = await pool.execute(
+      'SELECT id, business_date, bank_amount, note, created_at FROM pos_upi_settlements WHERE user_id = ? ORDER BY business_date DESC, id DESC LIMIT 30',
+      [user.id]
+    );
+    rows = r;
+  } catch (_) { rows = []; }
+  return { ok: true, saved: true, id: res.insertId, settlements: rows, items: rows };
 }
 
 async function hSetPosCounterCashier(req, args) {
@@ -1119,7 +1193,17 @@ async function hSetPosCounterCashier(req, args) {
 
 async function hSetPosUpiStatus(req, args) {
   const { user } = needAuth(await authUser(req));
-  return { ok: true, saved: true };
+  // REAL (v5): sale ki UPI status asal mein save
+  const pool = getPool();
+  const saleId = parseInt(args.sale_id || args.bill_id || args.id, 10) || 0;
+  const status = String(args.status || '').slice(0, 30);
+  if (saleId && status) {
+    await pool.execute(
+      'INSERT INTO pos_upi_status (user_id, sale_id, status) VALUES (?,?,?) ON DUPLICATE KEY UPDATE status=VALUES(status), created_at=CURRENT_TIMESTAMP',
+      [user.id, saleId, status]
+    );
+  }
+  return { ok: true, saved: true, sale_id: saleId, status };
 }
 
 async function hSyncOfflinePosSale(req, args) {
@@ -1199,7 +1283,15 @@ async function hVerifyPosDeliveryOtp(req, args) {
 
 async function hVoidPosSale(req, args) {
   const { user } = needAuth(await authUser(req));
-  return { ok: true, voided: true };
+  // REAL (v5): bill asal mein void mark — pos_voided_sales mein record
+  const pool = getPool();
+  const saleId = parseInt(args.sale_id || args.bill_id || args.id, 10) || 0;
+  const reason = args.reason ? String(args.reason).slice(0, 255) : (args.note ? String(args.note).slice(0, 255) : null);
+  if (!saleId) { const e = new Error('sale_id required'); e.status = 400; throw e; }
+  const [b] = await pool.execute('SELECT id FROM bills WHERE id = ? AND user_id = ?', [saleId, user.id]);
+  if (!b.length) { const e = new Error('sale not found'); e.status = 404; throw e; }
+  await pool.execute('INSERT INTO pos_voided_sales (user_id, sale_id, reason) VALUES (?,?,?)', [user.id, saleId, reason]);
+  return { ok: true, voided: true, sale_id: saleId };
 }
 
 async function hWatchPosProduct(req, args) {
@@ -1274,14 +1366,106 @@ async function hGetPosDeliveryCommerce(req, args) {
 
 async function hGetPosFraudDashboard(req, args) {
   const { user } = needAuth(await authUser(req));
+  // REAL (v5): void bills + zyada discount wale bills = asal fraud alerts
   // Frontend expects data.items, data.alerts, data.summary
-  return { ok: true, items: [], alerts: [], summary: { total: 0, revenue: 0, alerts: 0 } };
+  const pool = getPool();
+  const bdate = String(args.business_date || args.date || new Date().toISOString().slice(0, 10)).slice(0, 10);
+  const startMs = Number(args.day_start_ms) || 0;
+  const endMs = Number(args.day_end_ms) || 0;
+  const rng = (col) => (startMs && endMs)
+    ? { sql: col + ' >= FROM_UNIXTIME(?) AND ' + col + ' < FROM_UNIXTIME(?)', p: [Math.floor(startMs / 1000), Math.floor(endMs / 1000)] }
+    : { sql: 'DATE(' + col + ') = ?', p: [bdate] };
+  const items = [], alerts = [];
+  let totalSales = 0, revenue = 0;
+  try {
+    const r1 = rng('created_at');
+    const [sum] = await pool.execute(
+      'SELECT COUNT(*) AS c, COALESCE(SUM(total),0) AS rev FROM bills WHERE user_id = ? AND ' + r1.sql,
+      [user.id, ...r1.p]
+    );
+    totalSales = Number(sum[0].c) || 0; revenue = Number(sum[0].rev) || 0;
+  } catch (_) {}
+  try {
+    const r2 = rng('v.created_at');
+    const [voids] = await pool.execute(
+      'SELECT v.id, v.sale_id, v.reason, v.created_at, b.bill_no, b.total AS amount FROM pos_voided_sales v LEFT JOIN bills b ON b.id = v.sale_id WHERE v.user_id = ? AND ' + r2.sql + ' ORDER BY v.id DESC LIMIT 50',
+      [user.id, ...r2.p]
+    );
+    for (const v of voids) {
+      items.push({ type: 'void', id: v.id, sale_id: v.sale_id, bill_no: v.bill_no, amount: Number(v.amount) || 0, reason: v.reason, created_at: v.created_at });
+      alerts.push({ type: 'void', message: 'Bill ' + (v.bill_no || v.sale_id) + ' void kiya gaya', amount: Number(v.amount) || 0, created_at: v.created_at });
+    }
+  } catch (_) {}
+  try {
+    const r3 = rng('created_at');
+    const [hd] = await pool.execute(
+      'SELECT id, bill_no, subtotal, discount, total, created_at FROM bills WHERE user_id = ? AND ' + r3.sql + ' AND subtotal > 0 AND discount >= subtotal * 0.3 ORDER BY id DESC LIMIT 50',
+      [user.id, ...r3.p]
+    );
+    for (const b of hd) {
+      items.push({ type: 'high_discount', id: b.id, bill_no: b.bill_no, amount: Number(b.total) || 0, discount: Number(b.discount) || 0, created_at: b.created_at });
+      alerts.push({ type: 'high_discount', message: 'Bill ' + (b.bill_no || b.id) + ' pe zyada discount Rs.' + (Number(b.discount) || 0), amount: Number(b.total) || 0, created_at: b.created_at });
+    }
+  } catch (_) {}
+  return { ok: true, items, alerts, summary: { total: totalSales, revenue, alerts: alerts.length } };
 }
 
 async function hGetStaffSalaryReport(req, args) {
   const { user } = needAuth(await authUser(req));
+  // REAL (v5): pos_staff + hazri (pos_attendance) + advance (pos_advance) se asal hisab
   // Frontend expects data.report (object, never null)
-  return { ok: true, items: [], report: { total: 0, paid: 0, pending: 0, staff: [] }, total: 0 };
+  const pool = getPool();
+  const now = new Date();
+  const year = parseInt(args.year, 10) || now.getFullYear();
+  const month = parseInt(args.month, 10) || (now.getMonth() + 1);
+  const daysInMonth = new Date(year, month, 0).getDate();
+  const fromDate = year + '-' + String(month).padStart(2, '0') + '-01';
+  const toDate = year + '-' + String(month).padStart(2, '0') + '-' + String(daysInMonth).padStart(2, '0');
+  const staffRows = [];
+  let gTotal = 0, gPaid = 0, gPending = 0;
+  try {
+    const [staff] = await pool.execute(
+      'SELECT id, name, phone, monthly_salary FROM pos_staff WHERE user_id = ? AND active = 1 ORDER BY name',
+      [user.id]
+    );
+    for (const s of staff) {
+      let present = 0, half = 0, absent = 0, leave = 0;
+      try {
+        const [att] = await pool.execute(
+          "SELECT status, COUNT(*) AS c FROM pos_attendance WHERE user_id = ? AND staff_id = ? AND date >= ? AND date <= ? GROUP BY status",
+          [user.id, s.id, fromDate, toDate]
+        );
+        for (const a of att) {
+          if (a.status === 'present') present = Number(a.c) || 0;
+          else if (a.status === 'half') half = Number(a.c) || 0;
+          else if (a.status === 'absent') absent = Number(a.c) || 0;
+          else if (a.status === 'leave') leave = Number(a.c) || 0;
+        }
+      } catch (_) {}
+      let advance = 0;
+      try {
+        const [adv] = await pool.execute(
+          'SELECT COALESCE(SUM(amount),0) AS s FROM pos_advance WHERE user_id = ? AND staff_id = ? AND date >= ? AND date <= ?',
+          [user.id, s.id, fromDate, toDate]
+        );
+        advance = Number(adv[0].s) || 0;
+      } catch (_) {}
+      const monthly = Number(s.monthly_salary) || 0;
+      const worked = present + half * 0.5;
+      const earned = Math.round((monthly * worked / daysInMonth) * 100) / 100;
+      const pending = Math.max(0, Math.round((earned - advance) * 100) / 100);
+      staffRows.push({
+        staff_id: s.id, id: s.id, name: s.name, phone: s.phone,
+        monthly_salary: monthly, salary: earned, earned,
+        present_days: present, half_days: half, absent_days: absent, leave_days: leave,
+        worked_days: worked, days_in_month: daysInMonth,
+        advance, advances: advance, paid: advance, pending, total: earned
+      });
+      gTotal += earned; gPaid += advance; gPending += pending;
+    }
+  } catch (_) {}
+  const report = { total: Math.round(gTotal * 100) / 100, paid: Math.round(gPaid * 100) / 100, pending: Math.round(gPending * 100) / 100, staff: staffRows };
+  return { ok: true, items: staffRows, report, total: report.total };
 }
 
 async function hGetSupplierKhata(req, args) {
