@@ -2137,6 +2137,13 @@ async function hSaveAppSupportContact(req, args) {
 
 async function hGetMySubscription(req, args) {
   const { user } = needAuth(await authUser(req));
+  // Platform owner/admin (Admin's order, 2026-10-20): lifetime free, every
+  // option always unlocked, so the owner can test everything on his own
+  // platform. Only the first-ever user is 'owner'; signups get 'staff', and
+  // 'admin' is hand-appointed — customers never get this.
+  if (user.role === 'owner' || user.role === 'admin') {
+    return { ok: true, isPremium: true, isTrial: false, trialDaysLeft: 0, hasMultiBranch: true, plan: 'admin-lifetime' };
+  }
   const pool = getPool();
   // Check for active subscription
   const [subRows] = await pool.execute(
