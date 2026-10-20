@@ -500,23 +500,39 @@ async function customerBakiRows(userId) {
   const [rows] = await getPool().execute(
     `SELECT c.id AS customer_id, c.name AS customer_name, c.mobile,
             c.created_at AS joined_on,
+            COALESCE((SELECT SUM(b.total) FROM bills b WHERE b.customer_id = c.id AND b.user_id = c.user_id), 0) AS total_billed,
+            COALESCE((SELECT SUM(b.joma) FROM bills b WHERE b.customer_id = c.id AND b.user_id = c.user_id), 0) AS bills_joma,
             COALESCE((SELECT SUM(b.baki) FROM bills b WHERE b.customer_id = c.id AND b.user_id = c.user_id), 0) AS bills_baki,
             COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.customer_id = c.id AND p.user_id = c.user_id), 0) AS paid,
             (SELECT MAX(b.created_at) FROM bills b WHERE b.customer_id = c.id AND b.user_id = c.user_id) AS last_activity,
+            (SELECT MAX(b.created_at) FROM bills b WHERE b.customer_id = c.id AND b.user_id = c.user_id AND b.baki > 0) AS last_due_at,
+            (SELECT MIN(b.created_at) FROM bills b WHERE b.customer_id = c.id AND b.user_id = c.user_id AND b.baki > 0) AS oldest_due_at,
             (SELECT COUNT(*) FROM bills b WHERE b.customer_id = c.id AND b.user_id = c.user_id) AS bills_count
      FROM customers c WHERE c.user_id = ?`,
     [userId]
   );
-  return rows.map((r) => ({
-    customer_id: r.customer_id,
-    customer_name: r.customer_name,
-    name: r.customer_name,
-    mobile: r.mobile,
-    joined_on: r.joined_on,
-    last_activity: r.last_activity,
-    bills_count: Number(r.bills_count),
-    total_baki: Number(r.bills_baki) - Number(r.paid),
-  }));
+  return rows.map((r) => {
+    const totalBilled = Number(r.total_billed);
+    const paidSoFar = Number(r.bills_joma) + Number(r.paid);
+    const due = Number(r.bills_baki) - Number(r.paid);
+    let daysOverdue = 0;
+    if (due > 0 && r.oldest_due_at) {
+      daysOverdue = Math.max(0, Math.floor((Date.now() - new Date(r.oldest_due_at).getTime()) / 86400000));
+    }
+    return {
+      customer_id: r.customer_id, id: r.customer_id,
+      customer_name: r.customer_name, name: r.customer_name,
+      mobile: r.mobile,
+      joined_on: r.joined_on, joined_at: r.joined_on, created_at: r.joined_on,
+      last_activity: r.last_activity, last_activity_at: r.last_activity,
+      last_udhaar_at: r.last_due_at || r.last_activity, last_due_at: r.last_due_at,
+      bills_count: Number(r.bills_count), bill_count: Number(r.bills_count),
+      total_billed: totalBilled, total_business: totalBilled, total: totalBilled,
+      paid_so_far: paidSoFar, paid: paidSoFar,
+      total_baki: due, amount_due: due, total_due: due, baki: due,
+      days_overdue: daysOverdue,
+    };
+  });
 }
 
 async function hGetKhata(req) {
@@ -536,8 +552,11 @@ async function hGetBakiOverview(req, args) {
   const total_baki = all.reduce((s, c) => s + c.total_baki, 0);
   const start = (page - 1) * pageSize;
   return {
+    ok: true,
     customers: all.slice(start, start + pageSize),
     total_baki,
+    total_due: total_baki,
+    total_customers: all.length,
     page,
     page_size: pageSize,
     total: all.length,
@@ -738,10 +757,23 @@ async function hListBillsDirect(req, args) {
               b.counter, b.customer_id, b.branch_id, b.created_at, c.name AS customer_name, c.mobile AS customer_mobile
        FROM bills b LEFT JOIN customers c ON c.id = b.customer_id
        WHERE ${where.join(' AND ')} ORDER BY b.id DESC LIMIT ${limit}`, params);
-    const items = rows.map((r) => ({ ...r,
-      items: (() => { try { return JSON.parse(r.items || '[]'); } catch (_) { return []; } })(),
-      subtotal: Number(r.subtotal), discount: Number(r.discount), gst_amount: Number(r.gst_amount),
-      total: Number(r.total), joma: Number(r.joma), baki: Number(r.baki) }));
+    const items = rows.map((r) => {
+      let rawItems = [];
+      try { rawItems = JSON.parse(r.items || '[]'); } catch (_) { rawItems = []; }
+      const billItems = (Array.isArray(rawItems) ? rawItems : []).map((it, ix) => ({
+        id: ix + 1, bill_id: r.id,
+        item_name: it.item_name || it.name || '', name: it.item_name || it.name || '',
+        quantity: it.quantity != null ? it.quantity : (it.qty != null ? it.qty : 1), qty: it.quantity != null ? it.quantity : (it.qty != null ? it.qty : 1),
+        unit: it.unit || '', unit_price: it.unit_price != null ? it.unit_price : (it.rate || 0), rate: it.unit_price != null ? it.unit_price : (it.rate || 0),
+        amount: it.amount != null ? it.amount : ((it.quantity || it.qty || 1) * (it.unit_price || it.rate || 0)),
+        is_cut: !!it.is_cut, position: ix }));
+      const total = Number(r.total), joma = Number(r.joma), baki = Number(r.baki);
+      return { ...r, items: billItems,
+        bill_number: r.bill_no, mobile: r.customer_mobile,
+        subtotal: Number(r.subtotal), discount: Number(r.discount), gst_amount: Number(r.gst_amount),
+        total, joma, baki, paid_so_far: joma, remaining: baki,
+        payment_status: baki <= 0 ? 'paid' : (joma > 0 ? 'partial' : 'due'), payments: [] };
+    });
     return { ok: true, items, bills: items, total: items.length };
   } catch (_) { return { ok: true, items: [], bills: [], total: 0 }; }
 }
@@ -765,18 +797,36 @@ async function hListPosPaymentsDirect(req, args) {
 }
 async function hListCustomersDirectoryDirect(req, args) {
   const { user } = needAuth(await authUser(req));
-  const pool = getPool();
+  // v21: rows carried only id/name/mobile — the Customers screen showed
+  // 'Invalid Date' and Rs.NaN everywhere. Full balance rows now.
+  const q = String((args && args.query) || '').trim().toLowerCase();
   try {
-    const [rows] = await pool.execute(
-      'SELECT id, name, mobile FROM customers WHERE user_id = ? ORDER BY name LIMIT 500',
-      [user.id]
-    );
-    return { ok: true, items: rows, customers: rows, total: rows.length };
-  } catch (_) { return { ok: true, items: [], customers: [], total: 0 }; }
+    let rows = await customerBakiRows(user.id);
+    if (q) rows = rows.filter((c) => (c.customer_name || '').toLowerCase().includes(q) || String(c.mobile || '').includes(q));
+    const sort = String((args && args.sort) || 'recent');
+    if (sort === 'name') rows.sort((a, b) => String(a.customer_name).localeCompare(String(b.customer_name)));
+    else if (sort === 'due') rows.sort((a, b) => b.amount_due - a.amount_due);
+    else rows.sort((a, b) => new Date(b.last_activity_at || b.created_at || 0) - new Date(a.last_activity_at || a.created_at || 0));
+    const totalBaki = rows.reduce((s2, c) => s2 + Math.max(0, c.amount_due), 0);
+    return { ok: true, items: rows, customers: rows, total: rows.length,
+             total_customers: rows.length, all_time_total: rows.reduce((s2, c) => s2 + c.total_billed, 0),
+             total_baki: totalBaki, total_due: totalBaki };
+  } catch (_) { return { ok: true, items: [], customers: [], total: 0, total_customers: 0 }; }
 }
 async function hFindCustomersDirect(req, args) {
   const { user } = needAuth(await authUser(req));
-  return { ok: true, items: [], customers: [], total: 0 };
+  // v21: was a dummy — the bill dialog could never match an existing khata.
+  const name = String(args.name || '').trim().toLowerCase();
+  const mob = String(args.mobile || '').replace(/\D/g, '').slice(-10);
+  try {
+    let rows = await customerBakiRows(user.id);
+    rows = rows.filter((c) => {
+      if (mob && String(c.mobile || '').replace(/\D/g, '').slice(-10) === mob) return true;
+      if (name && (c.customer_name || '').toLowerCase().includes(name)) return true;
+      return false;
+    });
+    return { ok: true, customers: rows, items: rows, total: rows.length };
+  } catch (_) { return { ok: true, customers: [], items: [], total: 0 }; }
 }
 async function hGetSecurityQuestionDirect(req, args) {
   const { user } = needAuth(await authUser(req));
@@ -869,8 +919,19 @@ async function hSaveBillDirect(req, args) {
     const id = result.insertId;
     let bill_no = args.bill_no ? String(args.bill_no) : null;
     if (!bill_no) { bill_no = 'B' + id; await pool.execute('UPDATE bills SET bill_no = ? WHERE id = ?', [bill_no, id]); }
+    const billItems = items.map((it, ix) => ({
+      id: ix + 1, bill_id: id,
+      item_name: it.item_name || it.name || '', name: it.item_name || it.name || '',
+      quantity: it.quantity != null ? it.quantity : (it.qty != null ? it.qty : 1), qty: it.quantity != null ? it.quantity : (it.qty != null ? it.qty : 1),
+      unit: it.unit || '', unit_price: it.unit_price != null ? it.unit_price : (it.rate || 0), rate: it.unit_price != null ? it.unit_price : (it.rate || 0),
+      amount: it.amount != null ? it.amount : ((it.quantity || it.qty || 1) * (it.unit_price || it.rate || 0)),
+      is_cut: false, position: ix }));
     return { ok: true, saved: true, id, bill_id: id,
-      bill: { id, bill_no, mode, items, subtotal, discount, gst_amount, total, joma, baki, customer_id, branch_id } };
+      bill: { id, bill_number: bill_no, bill_no, mode, items: billItems, subtotal, discount, gst_amount, total,
+        paid_so_far: joma, joma, remaining: baki, baki,
+        payment_status: baki <= 0 ? 'paid' : (joma > 0 ? 'partial' : 'due'),
+        payments: [], customer_id, customer_name: args.customer_name || null,
+        mobile: args.customer_mobile || null, branch_id, created_at: new Date().toISOString() } };
   } catch (e) {
     const err = new Error('bill save failed: ' + (e.message || 'db error'));
     err.status = 500; throw err;
@@ -882,7 +943,27 @@ async function hDeleteBillDirect(req, args) {
 }
 async function hRecordPaymentDirect(req, args) {
   const { user } = needAuth(await authUser(req));
-  return { ok: true, recorded: true };
+  // v21: was a dummy that answered ok but recorded NOTHING — a bill's baki
+  // never reduced. Now updates the bill and writes the payment row.
+  const pool = getPool();
+  const billId = Number(args.bill_id || args.id);
+  const amount = Number(args.amount);
+  if (!Number.isFinite(billId) || !Number.isFinite(amount) || amount <= 0) {
+    const e = new Error('bill_id and valid amount required'); e.status = 400; throw e;
+  }
+  const [b] = await pool.execute('SELECT id, customer_id, total, joma FROM bills WHERE id = ? AND user_id = ?', [billId, user.id]);
+  if (!b.length) { const e = new Error('bill not found'); e.status = 404; throw e; }
+  const bill = b[0];
+  const newJoma = Math.min(Number(bill.total), Number(bill.joma) + amount);
+  const applied = newJoma - Number(bill.joma);
+  const newBaki = Math.max(0, Number(bill.total) - newJoma);
+  await pool.execute('UPDATE bills SET joma = ?, baki = ? WHERE id = ?', [newJoma, newBaki, billId]);
+  if (applied > 0) {
+    await pool.execute('INSERT INTO payments (user_id, customer_id, amount, note) VALUES (?, ?, ?, ?)',
+      [user.id, bill.customer_id || null, applied, 'Bill payment']);
+  }
+  return { ok: true, recorded: true, bill_id: billId, amount: applied,
+           paid_so_far: newJoma, remaining: newBaki, message: 'Payment saved.' };
 }
 async function hRecordCustomerPaymentDirect(req, args) {
   const { user } = needAuth(await authUser(req));
@@ -915,7 +996,16 @@ async function hMergeCustomersDirect(req, args) {
 }
 async function hSearchCustomerBalancesDirect(req, args) {
   const { user } = needAuth(await authUser(req));
-  return { ok: true, items: [], customers: [], total: 0 };
+  // v21: was a dummy returning nothing — Baki check could never find anyone.
+  const q = String(args.query || '').trim().toLowerCase();
+  const limit = Math.min(100, Math.max(1, Number(args.limit || 20)));
+  try {
+    let rows = await customerBakiRows(user.id);
+    if (q) rows = rows.filter((c) => (c.customer_name || '').toLowerCase().includes(q) || String(c.mobile || '').includes(q));
+    rows.sort((a, b) => b.amount_due - a.amount_due);
+    const out = rows.slice(0, limit);
+    return { ok: true, customers: out, items: out, total: out.length };
+  } catch (_) { return { ok: true, customers: [], items: [], total: 0 }; }
 }
 async function hDeleteCustomerDataDirect(req, args) {
   const { user } = needAuth(await authUser(req));
@@ -2393,9 +2483,16 @@ async function hGetMySubscription(req, args) {
   // 'admin' is hand-appointed — customers never get this.
   // Admin's own two numbers are also matched directly (his main account
   // 8373030203 has staff role but must get the same free access).
+  // v19: server-verified branch flag — the app locks branch accounts from
+  // THIS answer, so the lock follows the account (refresh/new tab safe).
+  let _isBranch = false; let _branchName = null;
+  try {
+    const [bb] = await getPool().execute('SELECT name FROM branches WHERE branch_user_id = ? LIMIT 1', [user.id]);
+    if (bb.length) { _isBranch = true; _branchName = bb[0].name; }
+  } catch (_) {}
   const _mob = String(user.mobile || '').replace(/\D/g, '').slice(-10);
   if (user.role === 'owner' || user.role === 'admin' || _mob === '9735744904' || _mob === '8373030203') {
-    return { ok: true, isPremium: true, isTrial: false, trialDaysLeft: 0, hasMultiBranch: true, plan: 'admin-lifetime' };
+    return { ok: true, is_branch: _isBranch, branch_name: _branchName, isPremium: true, isTrial: false, trialDaysLeft: 0, hasMultiBranch: true, plan: 'admin-lifetime' };
   }
   const pool = getPool();
   // Branch staff (manager-link users): access follows the branch OWNER's
@@ -2409,18 +2506,18 @@ async function hGetMySubscription(req, args) {
       if (owner) {
         const omob = String(owner.mobile || '').replace(/\D/g, '').slice(-10);
         if (owner.role === 'owner' || owner.role === 'admin' || omob === '9735744904' || omob === '8373030203') {
-          return { ok: true, isPremium: true, isTrial: false, trialDaysLeft: 0, hasMultiBranch: true, plan: 'admin-lifetime' };
+          return { ok: true, is_branch: _isBranch, branch_name: _branchName, isPremium: true, isTrial: false, trialDaysLeft: 0, hasMultiBranch: true, plan: 'admin-lifetime' };
         }
         const [os] = await pool.execute(
           'SELECT status, product_id FROM subscriptions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1', [br[0].owner_user_id]);
         const osub = os[0];
         if (osub && ['active', 'verified', 'trialing'].includes(osub.status)) {
-          return { ok: true, isPremium: true, isTrial: false, trialDaysLeft: 0, hasMultiBranch: true, plan: osub.product_id };
+          return { ok: true, is_branch: _isBranch, branch_name: _branchName, isPremium: true, isTrial: false, trialDaysLeft: 0, hasMultiBranch: true, plan: osub.product_id };
         }
         if (owner.created_at) {
           const odays = Math.floor((Date.now() - new Date(owner.created_at).getTime()) / 86400000);
           if (odays < 14) {
-            return { ok: true, isPremium: true, isTrial: true, trialDaysLeft: 14 - odays, hasMultiBranch: true, plan: null };
+            return { ok: true, is_branch: _isBranch, branch_name: _branchName, isPremium: true, isTrial: true, trialDaysLeft: 14 - odays, hasMultiBranch: true, plan: null };
           }
         }
       }
@@ -2455,7 +2552,7 @@ async function hGetMySubscription(req, args) {
     }
   }
   const hasMultiBranch = plan && plan.includes('branch');
-  return { ok: true, isPremium, isTrial, trialDaysLeft, hasMultiBranch: !!hasMultiBranch, plan };
+  return { ok: true, is_branch: _isBranch, branch_name: _branchName, isPremium, isTrial, trialDaysLeft, hasMultiBranch: !!hasMultiBranch, plan };
 }
 
 async function hVerifySubscription(req, args) {
