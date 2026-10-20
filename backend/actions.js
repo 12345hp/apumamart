@@ -2141,7 +2141,10 @@ async function hGetMySubscription(req, args) {
   // option always unlocked, so the owner can test everything on his own
   // platform. Only the first-ever user is 'owner'; signups get 'staff', and
   // 'admin' is hand-appointed — customers never get this.
-  if (user.role === 'owner' || user.role === 'admin') {
+  // Admin's own two numbers are also matched directly (his main account
+  // 8373030203 has staff role but must get the same free access).
+  const _mob = String(user.mobile || '').replace(/\D/g, '').slice(-10);
+  if (user.role === 'owner' || user.role === 'admin' || _mob === '9735744904' || _mob === '8373030203') {
     return { ok: true, isPremium: true, isTrial: false, trialDaysLeft: 0, hasMultiBranch: true, plan: 'admin-lifetime' };
   }
   const pool = getPool();
