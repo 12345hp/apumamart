@@ -1720,10 +1720,25 @@ async function hUpdateBranchManager(req, args) {
   );
   // Manager changed: end the branch user's live sessions at once — the old
   // manager is locked out immediately, not just when his session expires.
+  // Also sync the branch ACCOUNT's identity: new manager's name, and his
+  // number as the account mobile when that number is free (never steal
+  // another account's login number).
   try {
     const [brow] = await pool.execute('SELECT branch_user_id FROM branches WHERE id = ?', [branchId]);
     if (brow.length && brow[0].branch_user_id) {
-      await pool.execute('DELETE FROM sessions WHERE user_id = ?', [brow[0].branch_user_id]);
+      const bu = brow[0].branch_user_id;
+      await pool.execute('DELETE FROM sessions WHERE user_id = ?', [bu]);
+      const newName = String(args.manager_name || '').trim();
+      const newMob = String(args.manager_mobile || '').trim();
+      if (newName) {
+        await pool.execute('UPDATE users SET name = ? WHERE id = ?', [newName, bu]);
+      }
+      if (newMob) {
+        const [ex] = await pool.execute('SELECT id FROM users WHERE mobile = ? AND id <> ?', [newMob, bu]);
+        if (!ex.length) {
+          await pool.execute('UPDATE users SET mobile = ? WHERE id = ?', [newMob, bu]);
+        }
+      }
     }
   } catch (_) {}
   return { ok: true, branch_id: branchId, access_token: newToken,
