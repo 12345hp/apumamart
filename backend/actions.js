@@ -2148,9 +2148,9 @@ async function hGetSeasonAnalytics(req, args) {
       }
     }
     const top_sellers = [...map.values()].sort((a, b) => b.revenue - a.revenue).slice(0, 10);
-    return { season: s.season, total_revenue, bill_count: inSeason.length, top_sellers };
+    return { ok: true, season: s.season, total_revenue, bill_count: inSeason.length, top_sellers };
   });
-  return { available_years: years.map((y) => y.y), seasons };
+  return { ok: true, available_years: years.map((y) => y.y), seasons };
 }
 
 async function hGetBusinessProfile(req) {
@@ -2226,7 +2226,7 @@ async function hListRateCards(req) {
   const [rows] = await getPool().execute(
     'SELECT id, name, rate, unit FROM rate_cards WHERE user_id = ? ORDER BY name ASC', [user.id]
   );
-  return { rates: rows.map((r) => ({ ...r, rate: Number(r.rate) })) };
+  return { ok: true, rates: rows.map((r) => ({ ...r, rate: Number(r.rate) })) };
 }
 
 async function hSaveRateCard(req, args) {
@@ -2258,17 +2258,22 @@ async function hDeleteRateCard(req, args) {
 
 async function hGetAppSupportContact(req) {
   const { user } = needAuth(await authUser(req));
+  // v12 ROOT FIX: the chain is own number -> owner/admin saved number ->
+  // platform default. The platform number (8609793919, declared by Admin
+  // 2026-10-20) was typed once on a non-admin session, so it never reached
+  // this table and EVERY user's Help WhatsApp button came back empty.
   const pool = getPool();
-  const [rows] = await pool.execute('SELECT support_phone FROM app_settings WHERE user_id = ?', [user.id]);
-  if (rows[0] && rows[0].support_phone) return { phone: rows[0].support_phone };
-  // Platform-wide fallback (2026-10-20): a user who has not set their own
-  // number gets the platform owner's saved support number, so the Help &
-  // Support WhatsApp button works for every user.
-  const [ownerRows] = await pool.execute(
-    `SELECT s.support_phone FROM app_settings s JOIN users u ON u.id = s.user_id
-     WHERE u.role IN ('owner','admin') AND s.support_phone IS NOT NULL AND s.support_phone <> ''
-     ORDER BY (u.role = 'owner') DESC, s.user_id ASC LIMIT 1`);
-  return { phone: ownerRows[0] ? ownerRows[0].support_phone : null };
+  const PLATFORM_SUPPORT_PHONE = '8609793919';
+  try {
+    const [rows] = await pool.execute('SELECT support_phone FROM app_settings WHERE user_id = ?', [user.id]);
+    if (rows[0] && rows[0].support_phone) return { ok: true, phone: rows[0].support_phone };
+    const [ownerRows] = await pool.execute(
+      `SELECT s.support_phone FROM app_settings s JOIN users u ON u.id = s.user_id
+       WHERE s.support_phone IS NOT NULL AND s.support_phone <> ''
+       ORDER BY (u.role IN ('owner','admin')) DESC, s.user_id ASC LIMIT 1`);
+    if (ownerRows[0] && ownerRows[0].support_phone) return { ok: true, phone: ownerRows[0].support_phone };
+  } catch (_) {}
+  return { ok: true, phone: PLATFORM_SUPPORT_PHONE };
 }
 
 async function hSaveAppSupportContact(req, args) {
