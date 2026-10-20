@@ -1649,15 +1649,32 @@ async function hCreateBranch(req, args) {
   const name = String(args.name || '').trim();
   if (!name) throw Object.assign(new Error('Branch name required'), { status: 400 });
   const token = genBranchToken();
+  // Dedicated branch user for manager auto-login (created now so the link
+  // works from day one). Manager's own mobile is used only if it is not
+  // already someone's login — never hijack an existing account.
+  let branchUserId = null;
+  try {
+    let loginMobile = String(args.manager_mobile || '').trim() || null;
+    if (loginMobile) {
+      const [ex] = await pool.execute('SELECT id FROM users WHERE mobile = ?', [loginMobile]);
+      if (ex.length) loginMobile = null;
+    }
+    if (!loginMobile) loginMobile = 'br' + Date.now().toString(36) + Math.floor(Math.random()*9999);
+    const [ur] = await pool.execute(
+      "INSERT INTO users (name, mobile, role, business_name) VALUES (?, ?, 'staff', ?)",
+      [String(args.manager_name || '').trim() || (name + ' Manager'), loginMobile, name]
+    );
+    branchUserId = ur.insertId;
+  } catch (e) { console.error('[createBranch] branch user failed:', e.message); }
   const [r] = await pool.execute(
-    `INSERT INTO branches (owner_user_id, name, address, phone, manager_name, manager_mobile, access_token, token_active)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
+    `INSERT INTO branches (owner_user_id, name, address, phone, manager_name, manager_mobile, access_token, token_active, branch_user_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)`,
     [user.id, name,
      String(args.address || '').trim() || null,
      String(args.phone || '').trim() || null,
      String(args.manager_name || '').trim() || null,
      String(args.manager_mobile || '').trim() || null,
-     token]
+     token, branchUserId]
   );
   return { ok: true, branch_id: r.insertId, access_token: token,
            manager_link: '/branch.html?token=' + token };
@@ -1701,6 +1718,14 @@ async function hUpdateBranchManager(req, args) {
      String(args.manager_mobile || '').trim() || null,
      newToken, branchId]
   );
+  // Manager changed: end the branch user's live sessions at once — the old
+  // manager is locked out immediately, not just when his session expires.
+  try {
+    const [brow] = await pool.execute('SELECT branch_user_id FROM branches WHERE id = ?', [branchId]);
+    if (brow.length && brow[0].branch_user_id) {
+      await pool.execute('DELETE FROM sessions WHERE user_id = ?', [brow[0].branch_user_id]);
+    }
+  } catch (_) {}
   return { ok: true, branch_id: branchId, access_token: newToken,
            manager_link: '/branch.html?token=' + newToken };
 }
@@ -1726,7 +1751,7 @@ async function hGetBranchByToken(req, args) {
     throw Object.assign(new Error('Invalid link'), { status: 400 });
   const [rows] = await pool.execute(
     `SELECT b.id, b.name, b.address, b.phone, b.manager_name, b.manager_mobile,
-            u.business_name AS owner_business
+            b.branch_user_id, u.business_name AS owner_business
      FROM branches b JOIN users u ON u.id = b.owner_user_id
      WHERE b.access_token = ? AND b.token_active = 1`,
     [token]
@@ -1734,8 +1759,45 @@ async function hGetBranchByToken(req, args) {
   if (!rows.length)
     throw Object.assign(new Error('This link is expired or invalid. Ask the owner for a new link.'), { status: 403 });
   const b = rows[0];
+  // Manager auto-login (V8 design): each branch has a dedicated user; the link
+  // issues a login session for it, so the manager enters the full app locked
+  // to this branch. Branches created before this was wired get their branch
+  // user created lazily here — old links heal themselves, no recreate needed.
+  let branchUserId = b.branch_user_id || null;
+  if (branchUserId) {
+    const [u] = await pool.execute('SELECT id FROM users WHERE id = ?', [branchUserId]);
+    if (!u.length) branchUserId = null;
+  }
+  if (!branchUserId) {
+    try {
+      let loginMobile = String(b.manager_mobile || '').trim() || null;
+      if (loginMobile) {
+        const [ex] = await pool.execute('SELECT id FROM users WHERE mobile = ?', [loginMobile]);
+        if (ex.length) loginMobile = null; // number belongs to someone — never hijack it
+      }
+      if (!loginMobile) loginMobile = 'br' + b.id + Date.now().toString(36);
+      const [ur] = await pool.execute(
+        "INSERT INTO users (name, mobile, role, business_name) VALUES (?, ?, 'staff', ?)",
+        [b.manager_name || (b.name + ' Manager'), loginMobile, b.name]
+      );
+      branchUserId = ur.insertId;
+      await pool.execute('UPDATE branches SET branch_user_id = ? WHERE id = ?', [branchUserId, b.id]);
+    } catch (e) { console.error('[branchToken] branch user create failed:', e.message); }
+  }
+  let bst = null;
+  if (branchUserId) {
+    try {
+      bst = crypto.randomBytes(32).toString('hex');
+      const exp = new Date(Date.now() + 365*24*3600*1000);
+      await pool.execute(
+        'INSERT INTO sessions (user_id, token_hash, expires_at) VALUES (?, ?, ?)',
+        [branchUserId, crypto.createHash('sha256').update(bst).digest('hex'), exp]
+      );
+    } catch (e) { console.error('[branchToken] session failed:', e.message); bst = null; }
+  }
   return { ok: true, branch: { id: b.id, name: b.name, address: b.address,
-    phone: b.phone, manager_name: b.manager_name, owner_business: b.owner_business } };
+    phone: b.phone, manager_name: b.manager_name, owner_business: b.owner_business },
+    session_token: bst };
 }
 
 async function hListPosAdvance(req, args) {
@@ -2148,6 +2210,34 @@ async function hGetMySubscription(req, args) {
     return { ok: true, isPremium: true, isTrial: false, trialDaysLeft: 0, hasMultiBranch: true, plan: 'admin-lifetime' };
   }
   const pool = getPool();
+  // Branch staff (manager-link users): access follows the branch OWNER's
+  // plan. Owner premium => manager app stays open; owner locked => locked.
+  try {
+    const [br] = await pool.execute(
+      'SELECT owner_user_id FROM branches WHERE branch_user_id = ? AND token_active = 1 LIMIT 1', [user.id]);
+    if (br.length) {
+      const [ow] = await pool.execute('SELECT role, mobile, created_at FROM users WHERE id = ?', [br[0].owner_user_id]);
+      const owner = ow[0];
+      if (owner) {
+        const omob = String(owner.mobile || '').replace(/\D/g, '').slice(-10);
+        if (owner.role === 'owner' || owner.role === 'admin' || omob === '9735744904' || omob === '8373030203') {
+          return { ok: true, isPremium: true, isTrial: false, trialDaysLeft: 0, hasMultiBranch: true, plan: 'admin-lifetime' };
+        }
+        const [os] = await pool.execute(
+          'SELECT status, product_id FROM subscriptions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1', [br[0].owner_user_id]);
+        const osub = os[0];
+        if (osub && ['active', 'verified', 'trialing'].includes(osub.status)) {
+          return { ok: true, isPremium: true, isTrial: false, trialDaysLeft: 0, hasMultiBranch: true, plan: osub.product_id };
+        }
+        if (owner.created_at) {
+          const odays = Math.floor((Date.now() - new Date(owner.created_at).getTime()) / 86400000);
+          if (odays < 14) {
+            return { ok: true, isPremium: true, isTrial: true, trialDaysLeft: 14 - odays, hasMultiBranch: true, plan: null };
+          }
+        }
+      }
+    }
+  } catch (_) {}
   // Check for active subscription
   const [subRows] = await pool.execute(
     'SELECT status, product_id FROM subscriptions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
