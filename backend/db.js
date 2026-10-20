@@ -370,6 +370,40 @@ const SCHEMA = [
   INDEX idx_deliveryslots_user (user_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 
+`CREATE TABLE IF NOT EXISTS pos_voided_sales (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  sale_id INT NOT NULL,
+  reason VARCHAR(255) NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_void_user_created (user_id, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+`CREATE TABLE IF NOT EXISTS pos_upi_settlements (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  business_date DATE NOT NULL,
+  bank_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+  note VARCHAR(255) NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_upiset_user_date (user_id, business_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+`CREATE TABLE IF NOT EXISTS pos_upi_status (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  sale_id INT NOT NULL,
+  status VARCHAR(30) NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_upistatus_user_sale (user_id, sale_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+`CREATE TABLE IF NOT EXISTS pos_staff_discount_rules (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  staff_name VARCHAR(100) NOT NULL,
+  staff_pin VARCHAR(10) NULL,
+  max_discount_percent DECIMAL(5,2) NOT NULL DEFAULT 0,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_sdr_user_name (user_id, staff_name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 `CREATE TABLE IF NOT EXISTS pos_delivery_otps (
   id INT AUTO_INCREMENT PRIMARY KEY,
   user_id INT NOT NULL,
