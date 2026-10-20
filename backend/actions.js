@@ -627,8 +627,23 @@ async function hGetPosGrowthDashboard(req, args) {
 
 async function hGetPosAttendance(req, args) {
   const { user } = needAuth(await authUser(req));
-  // Frontend expects data.attendance
-  return { ok: true, items: [], attendance: [], date: args.business_date || null };
+  // REAL (v11): app reads data.attendance[] {staff_id, date 'YYYY-MM-DD', status}
+  const pool = getPool();
+  const now = new Date();
+  const year = parseInt(args.year, 10) || now.getFullYear();
+  const month = parseInt(args.month, 10) || (now.getMonth() + 1);
+  const fromDate = year + '-' + String(month).padStart(2, '0') + '-01';
+  const toDate = year + '-' + String(month).padStart(2, '0') + '-31';
+  try {
+    const [rows] = await pool.execute(
+      "SELECT staff_id, DATE_FORMAT(date, '%Y-%m-%d') AS date, status FROM pos_attendance WHERE user_id = ? AND date >= ? AND date <= ? ORDER BY date ASC LIMIT 2000",
+      [user.id, fromDate, toDate]
+    );
+    const attendance = rows.map(r => ({ staff_id: r.staff_id, date: r.date, status: r.status }));
+    return { ok: true, attendance, items: attendance, total: attendance.length };
+  } catch (_) {
+    return { ok: true, attendance: [], items: [], total: 0 };
+  }
 }
 
 async function hGetPosCounterCart(req, args) {
@@ -645,15 +660,26 @@ async function hGetPosCounters(req, args) {
 
 async function hListPosDayCloses(req, args) {
   const { user } = needAuth(await authUser(req));
-  // REAL (v5): day_closes table se asal list
+  // REAL (v11): app reads closes[] with business_date, counter_number and a
+  // ready-made difference — map the table columns to those names.
   const pool = getPool();
   const limit = Math.min(parseInt(args.limit, 10) || 30, 100);
   try {
     const [rows] = await pool.execute(
-      'SELECT id, counter_id, date, expected_cash, actual_cash, note, created_at FROM day_closes WHERE user_id = ? ORDER BY date DESC, id DESC LIMIT ' + limit,
+      "SELECT id, counter_id, DATE_FORMAT(date, '%Y-%m-%d') AS business_date, expected_cash, actual_cash, note, created_at FROM day_closes WHERE user_id = ? ORDER BY date DESC, id DESC LIMIT " + limit,
       [user.id]
     );
-    return { ok: true, items: rows, day_closes: rows, closes: rows, total: rows.length };
+    const closes = rows.map(r => ({
+      id: r.id,
+      business_date: r.business_date,
+      counter_number: r.counter_id,
+      counter_id: r.counter_id,
+      expected_cash: Number(r.expected_cash) || 0,
+      actual_cash: Number(r.actual_cash) || 0,
+      difference: Math.round(((Number(r.actual_cash) || 0) - (Number(r.expected_cash) || 0)) * 100) / 100,
+      note: r.note, created_at: r.created_at
+    }));
+    return { ok: true, items: closes, day_closes: closes, closes, total: closes.length };
   } catch (_) {
     return { ok: true, items: [], day_closes: [], closes: [], total: 0 };
   }
@@ -1366,8 +1392,10 @@ async function hGetPosDeliveryCommerce(req, args) {
 
 async function hGetPosFraudDashboard(req, args) {
   const { user } = needAuth(await authUser(req));
-  // REAL (v5): void bills + zyada discount wale bills = asal fraud alerts
-  // Frontend expects data.items, data.alerts, data.summary
+  // REAL (v11): the app reads data.staff_rules[], data.upi{}, data.voids[],
+  // data.discounts[] — the old answer ({items, alerts, summary}) had NONE of
+  // those keys, so opening Mall tools crashed the app ("Page could not open").
+  // Every key is ALWAYS present with the right type, even when empty.
   const pool = getPool();
   const bdate = String(args.business_date || args.date || new Date().toISOString().slice(0, 10)).slice(0, 10);
   const startMs = Number(args.day_start_ms) || 0;
@@ -1375,39 +1403,69 @@ async function hGetPosFraudDashboard(req, args) {
   const rng = (col) => (startMs && endMs)
     ? { sql: col + ' >= FROM_UNIXTIME(?) AND ' + col + ' < FROM_UNIXTIME(?)', p: [Math.floor(startMs / 1000), Math.floor(endMs / 1000)] }
     : { sql: 'DATE(' + col + ') = ?', p: [bdate] };
-  const items = [], alerts = [];
-  let totalSales = 0, revenue = 0;
+  const out = {
+    ok: true,
+    staff_rules: [],
+    upi: { pos_total: 0, bank_amount: 0, difference: 0, pending_count: 0, failed_count: 0 },
+    voids: [],
+    discounts: [],
+    items: [], alerts: [], summary: { total: 0, revenue: 0, alerts: 0 }
+  };
   try {
-    const r1 = rng('created_at');
+    const [rules] = await pool.execute(
+      'SELECT staff_name AS cashier_name, max_discount_percent FROM pos_staff_discount_rules WHERE user_id = ? ORDER BY staff_name',
+      [user.id]
+    );
+    out.staff_rules = rules.map(r => ({ cashier_name: r.cashier_name, max_discount_percent: Number(r.max_discount_percent) || 0 }));
+  } catch (_) {}
+  try {
+    const r = rng('created_at');
+    const [u] = await pool.execute(
+      "SELECT COALESCE(SUM(total),0) AS s FROM bills WHERE user_id = ? AND payment_mode = 'upi' AND " + r.sql,
+      [user.id, ...r.p]
+    );
+    out.upi.pos_total = Number(u[0].s) || 0;
+    const [st] = await pool.execute(
+      'SELECT bank_amount FROM pos_upi_settlements WHERE user_id = ? AND business_date = ? ORDER BY id DESC LIMIT 1',
+      [user.id, bdate]
+    );
+    out.upi.bank_amount = st.length ? (Number(st[0].bank_amount) || 0) : 0;
+    out.upi.difference = Math.round((out.upi.bank_amount - out.upi.pos_total) * 100) / 100;
+    const rc = rng('created_at');
+    const [pc] = await pool.execute(
+      'SELECT status, COUNT(*) AS c FROM pos_upi_status WHERE user_id = ? AND ' + rc.sql + ' GROUP BY status',
+      [user.id, ...rc.p]
+    );
+    for (const row of pc) {
+      if (row.status === 'pending') out.upi.pending_count = Number(row.c) || 0;
+      if (row.status === 'failed') out.upi.failed_count = Number(row.c) || 0;
+    }
+  } catch (_) {}
+  try {
+    const r = rng('v.created_at');
+    const [v] = await pool.execute(
+      "SELECT COALESCE(b.counter, '—') AS cashier_name, COUNT(*) AS void_count, COALESCE(SUM(b.total),0) AS void_amount FROM pos_voided_sales v LEFT JOIN bills b ON b.id = v.sale_id WHERE v.user_id = ? AND " + r.sql + ' GROUP BY cashier_name ORDER BY void_count DESC LIMIT 50',
+      [user.id, ...r.p]
+    );
+    out.voids = v.map(x => ({ cashier_name: x.cashier_name, void_count: Number(x.void_count) || 0, void_amount: Number(x.void_amount) || 0 }));
+  } catch (_) {}
+  try {
+    const r = rng('created_at');
+    const [d] = await pool.execute(
+      "SELECT COALESCE(counter, '—') AS cashier_name, COUNT(*) AS discount_count, COALESCE(SUM(discount),0) AS discount_amount FROM bills WHERE user_id = ? AND discount > 0 AND " + r.sql + ' GROUP BY cashier_name ORDER BY discount_amount DESC LIMIT 50',
+      [user.id, ...r.p]
+    );
+    out.discounts = d.map(x => ({ cashier_name: x.cashier_name, discount_count: Number(x.discount_count) || 0, discount_amount: Number(x.discount_amount) || 0 }));
+  } catch (_) {}
+  try {
+    const r = rng('created_at');
     const [sum] = await pool.execute(
-      'SELECT COUNT(*) AS c, COALESCE(SUM(total),0) AS rev FROM bills WHERE user_id = ? AND ' + r1.sql,
-      [user.id, ...r1.p]
+      'SELECT COUNT(*) AS c, COALESCE(SUM(total),0) AS rev FROM bills WHERE user_id = ? AND ' + r.sql,
+      [user.id, ...r.p]
     );
-    totalSales = Number(sum[0].c) || 0; revenue = Number(sum[0].rev) || 0;
+    out.summary = { total: Number(sum[0].c) || 0, revenue: Number(sum[0].rev) || 0, alerts: out.voids.length + out.discounts.length };
   } catch (_) {}
-  try {
-    const r2 = rng('v.created_at');
-    const [voids] = await pool.execute(
-      'SELECT v.id, v.sale_id, v.reason, v.created_at, b.bill_no, b.total AS amount FROM pos_voided_sales v LEFT JOIN bills b ON b.id = v.sale_id WHERE v.user_id = ? AND ' + r2.sql + ' ORDER BY v.id DESC LIMIT 50',
-      [user.id, ...r2.p]
-    );
-    for (const v of voids) {
-      items.push({ type: 'void', id: v.id, sale_id: v.sale_id, bill_no: v.bill_no, amount: Number(v.amount) || 0, reason: v.reason, created_at: v.created_at });
-      alerts.push({ type: 'void', message: 'Bill ' + (v.bill_no || v.sale_id) + ' void kiya gaya', amount: Number(v.amount) || 0, created_at: v.created_at });
-    }
-  } catch (_) {}
-  try {
-    const r3 = rng('created_at');
-    const [hd] = await pool.execute(
-      'SELECT id, bill_no, subtotal, discount, total, created_at FROM bills WHERE user_id = ? AND ' + r3.sql + ' AND subtotal > 0 AND discount >= subtotal * 0.3 ORDER BY id DESC LIMIT 50',
-      [user.id, ...r3.p]
-    );
-    for (const b of hd) {
-      items.push({ type: 'high_discount', id: b.id, bill_no: b.bill_no, amount: Number(b.total) || 0, discount: Number(b.discount) || 0, created_at: b.created_at });
-      alerts.push({ type: 'high_discount', message: 'Bill ' + (b.bill_no || b.id) + ' pe zyada discount Rs.' + (Number(b.discount) || 0), amount: Number(b.total) || 0, created_at: b.created_at });
-    }
-  } catch (_) {}
-  return { ok: true, items, alerts, summary: { total: totalSales, revenue, alerts: alerts.length } };
+  return out;
 }
 
 async function hGetStaffSalaryReport(req, args) {
@@ -1459,13 +1517,13 @@ async function hGetStaffSalaryReport(req, args) {
         monthly_salary: monthly, salary: earned, earned,
         present_days: present, half_days: half, absent_days: absent, leave_days: leave,
         worked_days: worked, days_in_month: daysInMonth,
-        advance, advances: advance, paid: advance, pending, total: earned
+        advance, advances: advance, paid: advance, pending, total: earned, net_payable: pending, gross_payable: earned
       });
       gTotal += earned; gPaid += advance; gPending += pending;
     }
   } catch (_) {}
   const report = { total: Math.round(gTotal * 100) / 100, paid: Math.round(gPaid * 100) / 100, pending: Math.round(gPending * 100) / 100, staff: staffRows };
-  return { ok: true, items: staffRows, report, total: report.total };
+  return { ok: true, items: staffRows, report: staffRows, total: report.total, summary: report };
 }
 
 async function hGetSupplierKhata(req, args) {
@@ -1817,8 +1875,23 @@ async function hGetBranchByToken(req, args) {
 
 async function hListPosAdvance(req, args) {
   const { user } = needAuth(await authUser(req));
-  // Frontend expects data.report (object, never null)
-  return { ok: true, items: [], report: { total: 0, items: [] }, total: 0 };
+  // REAL (v11): app reads data.advances[] {id, staff_name, amount, date, note}
+  const pool = getPool();
+  const now = new Date();
+  const year = parseInt(args.year, 10) || now.getFullYear();
+  const month = parseInt(args.month, 10) || (now.getMonth() + 1);
+  const fromDate = year + '-' + String(month).padStart(2, '0') + '-01';
+  const toDate = year + '-' + String(month).padStart(2, '0') + '-31';
+  try {
+    const [rows] = await pool.execute(
+      "SELECT a.id, a.staff_id, s.name AS staff_name, a.amount, DATE_FORMAT(a.date, '%Y-%m-%d') AS date, a.note FROM pos_advance a LEFT JOIN pos_staff s ON s.id = a.staff_id WHERE a.user_id = ? AND a.date >= ? AND a.date <= ? ORDER BY a.date DESC, a.id DESC LIMIT 200",
+      [user.id, fromDate, toDate]
+    );
+    const advances = rows.map(r => ({ id: r.id, staff_id: r.staff_id, staff_name: r.staff_name || '—', amount: Number(r.amount) || 0, date: r.date, note: r.note || '' }));
+    return { ok: true, advances, items: advances, total: advances.length };
+  } catch (_) {
+    return { ok: true, advances: [], items: [], total: 0 };
+  }
 }
 
 // ---- Missing POS actions: full implementations (1-year warranty) ----
