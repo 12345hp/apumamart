@@ -713,7 +713,7 @@ async function hListPosStaffDirect(req, args) {
   const pool = getPool();
   try {
     const [rows] = await pool.execute(
-      'SELECT id, name, mobile, pin, role, salary FROM pos_staff WHERE user_id = ? ORDER BY name LIMIT 200',
+      'SELECT id, name, phone, phone AS mobile, staff_pin, staff_pin AS pin, monthly_salary, monthly_salary AS salary, join_date FROM pos_staff WHERE user_id = ? ORDER BY name LIMIT 200',
       [user.id]
     );
     return { ok: true, items: rows, staff: rows, total: rows.length };
@@ -721,11 +721,47 @@ async function hListPosStaffDirect(req, args) {
 }
 async function hListBillsDirect(req, args) {
   const { user } = needAuth(await authUser(req));
-  return { ok: true, items: [], bills: [], total: 0 };
+  // v15 (2026-10-20): this was a dummy that ALWAYS returned an empty list —
+  // bills saved fine but no screen could ever list them. Real query now.
+  const pool = getPool();
+  const limit = Math.min(500, Math.max(1, Number(args.limit || 100)));
+  const where = ['b.user_id = ?'];
+  const params = [user.id];
+  if (args.mode === 'future' || args.mode === 'modern') { where.push('b.mode = ?'); params.push(args.mode); }
+  if (args.customer_id) { where.push('b.customer_id = ?'); params.push(Number(args.customer_id)); }
+  if (args.date) { where.push('DATE(b.created_at) = ?'); params.push(String(args.date).slice(0, 10)); }
+  if (args.from) { where.push('DATE(b.created_at) >= ?'); params.push(String(args.from).slice(0, 10)); }
+  if (args.to) { where.push('DATE(b.created_at) <= ?'); params.push(String(args.to).slice(0, 10)); }
+  try {
+    const [rows] = await pool.execute(
+      `SELECT b.id, b.bill_no, b.mode, b.items, b.subtotal, b.discount, b.gst_amount, b.total, b.joma, b.baki,
+              b.counter, b.customer_id, b.branch_id, b.created_at, c.name AS customer_name, c.mobile AS customer_mobile
+       FROM bills b LEFT JOIN customers c ON c.id = b.customer_id
+       WHERE ${where.join(' AND ')} ORDER BY b.id DESC LIMIT ${limit}`, params);
+    const items = rows.map((r) => ({ ...r,
+      items: (() => { try { return JSON.parse(r.items || '[]'); } catch (_) { return []; } })(),
+      subtotal: Number(r.subtotal), discount: Number(r.discount), gst_amount: Number(r.gst_amount),
+      total: Number(r.total), joma: Number(r.joma), baki: Number(r.baki) }));
+    return { ok: true, items, bills: items, total: items.length };
+  } catch (_) { return { ok: true, items: [], bills: [], total: 0 }; }
 }
 async function hListPosPaymentsDirect(req, args) {
   const { user } = needAuth(await authUser(req));
-  return { ok: true, items: [], payments: [], total: 0 };
+  // v16 (2026-10-20): was a dummy returning an empty list while real
+  // payments were being recorded — payment history showed nothing.
+  const pool = getPool();
+  const limit = Math.min(500, Math.max(1, Number(args.limit || 100)));
+  const where = ['p.user_id = ?'];
+  const params = [user.id];
+  if (args.customer_id) { where.push('p.customer_id = ?'); params.push(Number(args.customer_id)); }
+  try {
+    const [rows] = await pool.execute(
+      `SELECT p.id, p.customer_id, p.amount, p.note, p.created_at, c.name AS customer_name, c.mobile AS customer_mobile
+       FROM payments p LEFT JOIN customers c ON c.id = p.customer_id
+       WHERE ${where.join(' AND ')} ORDER BY p.id DESC LIMIT ${limit}`, params);
+    const items = rows.map((r) => ({ ...r, amount: Number(r.amount) }));
+    return { ok: true, items, payments: items, total: items.length };
+  } catch (_) { return { ok: true, items: [], payments: [], total: 0 }; }
 }
 async function hListCustomersDirectoryDirect(req, args) {
   const { user } = needAuth(await authUser(req));
@@ -771,25 +807,70 @@ async function hSavePosProductDirect(req, args) {
 async function hSaveBillDirect(req, args) {
   const { user } = needAuth(await authUser(req));
   const pool = getPool();
-  const customer_id = args.customer_id ? Number(args.customer_id) : null;
-  const items = args.items || [];
-  const subtotal = Number(args.subtotal || 0);
+  // v13 (2026-10-20): the "Write the bill" workspace sends a DIFFERENT
+  // contract than the manual-lines workspace: { raw_input, paid_amount,
+  // round_total, customer_name, customer_mobile, create_customer,
+  // branch_id } with NO items/total. The old handler only understood
+  // { items, total } -> every khata save from that screen died with
+  // 'bill total ya items required'. Both contracts are honoured now.
+  const digits = (v) => String(v == null ? '' : v).replace(/\D/g, '').slice(-10);
+  let customer_id = args.customer_id ? Number(args.customer_id) : null;
+  if (customer_id) {
+    const [own] = await pool.execute('SELECT id FROM customers WHERE id = ? AND user_id = ?', [customer_id, user.id]);
+    if (!own.length) customer_id = null;
+  }
+  if (!customer_id && args.create_customer && (args.customer_name || args.customer_mobile)) {
+    const cName = args.customer_name ? String(args.customer_name).slice(0, 120) : '';
+    const cMob = args.customer_mobile ? String(args.customer_mobile).slice(0, 30) : '';
+    if (digits(cMob).length === 10) {
+      const [ex] = await pool.execute(
+        'SELECT id FROM customers WHERE user_id = ? AND RIGHT(REPLACE(REPLACE(mobile, " ", ""), "+91", ""), 10) = ? LIMIT 1',
+        [user.id, digits(cMob)]);
+      if (ex.length) customer_id = ex[0].id;
+    }
+    if (!customer_id && cName) {
+      const [ins] = await pool.execute('INSERT INTO customers (user_id, name, mobile) VALUES (?, ?, ?)', [user.id, cName, cMob || null]);
+      customer_id = ins.insertId;
+    }
+  }
+  let items = Array.isArray(args.items) ? args.items : [];
+  if (!items.length && args.raw_input) {
+    items = String(args.raw_input).split(/\n+/).map((ln) => ln.trim()).filter(Boolean).map((ln) => {
+      const m = ln.match(/(\d+(?:\.\d+)?)\s*$/);
+      const amount = m ? Number(m[1]) : 0;
+      const name = m ? ln.slice(0, m.index).trim() || ln : ln;
+      return { name, qty: 1, rate: amount, amount };
+    });
+  }
+  const total = Number(args.total || args.round_total || 0);
+  const joma = Number(args.joma != null ? args.joma : (args.paid != null ? args.paid : (args.paid_amount || 0)));
+  const subtotal = Number(args.subtotal || total);
   const discount = Number(args.discount || 0);
   const gst_amount = Number(args.gst_amount || args.gst || 0);
-  const total = Number(args.total || 0);
-  const joma = Number(args.joma || args.paid || 0);
-  const baki = Number(args.baki || Math.max(0, total - joma));
+  const baki = Number(args.baki != null ? args.baki : Math.max(0, total - joma));
   const mode = args.mode === 'modern' ? 'modern' : 'future';
-  const bill_no = args.bill_no ? String(args.bill_no) : null;
   const counter = args.counter ? String(args.counter) : null;
   if (total <= 0 && !items.length) { const e = new Error('bill total ya items required'); e.status = 400; throw e; }
+  // Branch stamping: a branch session always stamps its OWN branch; an
+  // owner session may stamp one of its own branches; anything else = null.
+  let branch_id = null;
+  const [myBranch] = await pool.execute('SELECT id FROM branches WHERE branch_user_id = ?', [user.id]);
+  if (myBranch.length) branch_id = myBranch[0].id;
+  else if (args.branch_id) {
+    const [ownB] = await pool.execute('SELECT id FROM branches WHERE id = ? AND owner_user_id = ?', [Number(args.branch_id), user.id]);
+    if (ownB.length) branch_id = ownB[0].id;
+  }
   try {
     const [result] = await pool.execute(
-      `INSERT INTO bills (user_id, customer_id, bill_no, mode, items, subtotal, discount, gst_amount, total, joma, baki, counter)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [user.id, customer_id, bill_no, mode, JSON.stringify(items), subtotal, discount, gst_amount, total, joma, baki, counter]
+      `INSERT INTO bills (user_id, customer_id, bill_no, mode, items, subtotal, discount, gst_amount, total, joma, baki, counter, branch_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [user.id, customer_id, args.bill_no ? String(args.bill_no) : null, mode, JSON.stringify(items), subtotal, discount, gst_amount, total, joma, baki, counter, branch_id]
     );
-    return { ok: true, saved: true, id: result.insertId, bill_id: result.insertId };
+    const id = result.insertId;
+    let bill_no = args.bill_no ? String(args.bill_no) : null;
+    if (!bill_no) { bill_no = 'B' + id; await pool.execute('UPDATE bills SET bill_no = ? WHERE id = ?', [bill_no, id]); }
+    return { ok: true, saved: true, id, bill_id: id,
+      bill: { id, bill_no, mode, items, subtotal, discount, gst_amount, total, joma, baki, customer_id, branch_id } };
   } catch (e) {
     const err = new Error('bill save failed: ' + (e.message || 'db error'));
     err.status = 500; throw err;
@@ -1630,7 +1711,21 @@ async function hListPosPurchaseOrdersDirect(req, args) {
 }
 async function hListPaymentsDirect(req, args) {
   const { user } = needAuth(await authUser(req));
-  return { ok: true, payments: [], items: [] };
+  // v16 (2026-10-20): was a dummy returning an empty list while real
+  // payments were being recorded — payment history showed nothing.
+  const pool = getPool();
+  const limit = Math.min(500, Math.max(1, Number(args.limit || 100)));
+  const where = ['p.user_id = ?'];
+  const params = [user.id];
+  if (args.customer_id) { where.push('p.customer_id = ?'); params.push(Number(args.customer_id)); }
+  try {
+    const [rows] = await pool.execute(
+      `SELECT p.id, p.customer_id, p.amount, p.note, p.created_at, c.name AS customer_name, c.mobile AS customer_mobile
+       FROM payments p LEFT JOIN customers c ON c.id = p.customer_id
+       WHERE ${where.join(' AND ')} ORDER BY p.id DESC LIMIT ${limit}`, params);
+    const items = rows.map((r) => ({ ...r, amount: Number(r.amount) }));
+    return { ok: true, items, payments: items, total: items.length };
+  } catch (_) { return { ok: true, items: [], payments: [], total: 0 }; }
 }
 
 
