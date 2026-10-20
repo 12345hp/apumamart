@@ -449,8 +449,17 @@ const SCHEMA = [
   INDEX idx_loginalert_user (user_id),
   INDEX idx_loginalert_created (created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+`CREATE TABLE IF NOT EXISTS future_calculations (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  title VARCHAR(200) NOT NULL DEFAULT '',
+  kind VARCHAR(50) NULL,
+  data TEXT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_future_calc_user (user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 ];
-
 // Add columns to bills that didn't exist in the original schema.
 // MySQL has no ADD COLUMN IF NOT EXISTS, so check INFORMATION_SCHEMA first.
 async function ensureBillColumns(pool) {
