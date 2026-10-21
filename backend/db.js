@@ -459,6 +459,39 @@ const SCHEMA = [
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   INDEX idx_future_calc_user (user_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+`CREATE TABLE IF NOT EXISTS referrals (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  referrer_user_id INT NOT NULL,
+  referred_user_id INT NOT NULL UNIQUE,
+  code VARCHAR(40) NOT NULL,
+  rewarded TINYINT NOT NULL DEFAULT 0,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_referrals_referrer (referrer_user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+`CREATE TABLE IF NOT EXISTS partner_applications (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(100) NOT NULL,
+  mobile VARCHAR(20) NOT NULL,
+  area VARCHAR(150) NULL,
+  message TEXT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+`CREATE TABLE IF NOT EXISTS referral_codes (
+  user_id INT PRIMARY KEY,
+  code VARCHAR(40) NOT NULL UNIQUE,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+`CREATE TABLE IF NOT EXISTS reviews (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  shop_name VARCHAR(150) NULL,
+  reviewer_name VARCHAR(100) NULL,
+  rating INT NOT NULL,
+  text TEXT NULL,
+  approved TINYINT NOT NULL DEFAULT 0,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_reviews_approved (approved, id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 ];
 // Add columns to bills that didn't exist in the original schema.
 // MySQL has no ADD COLUMN IF NOT EXISTS, so check INFORMATION_SCHEMA first.
@@ -507,6 +540,10 @@ async function ensureBillColumns(pool) {
     ['business_category', 'VARCHAR(100) NULL'],
     ['business_subcategory', 'VARCHAR(100) NULL'],
     ['photo_url', 'VARCHAR(500) NULL'],
+    // Google login (prepared 2026-10-21, item 16): identity columns for the
+    // guarded googleAuth action. Nullable; normal mobile users never touch them.
+    ['email', 'VARCHAR(190) NULL'],
+    ['google_sub', 'VARCHAR(255) NULL'],
   ];
   for (const [col, def] of userCols) {
     const [rows] = await pool.execute(
