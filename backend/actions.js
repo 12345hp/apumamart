@@ -485,16 +485,34 @@ async function hListCustomerLedger(req, args) {
     `SELECT * FROM bills ${where} ORDER BY id DESC LIMIT ?`, [...qargs, limit + 1]
   );
   const hasMore = bills.length > limit;
+  // Fix 2026-10-21: bills used to be returned as raw DB rows — the stored
+  // item JSON uses {name, qty, rate} but the ledger screen reads
+  // item_name / quantity / unit / amount, so every item line rendered as
+  // 'undefined', and bill_number was missing (the column is bill_no).
+  // Map to the same bill shape as listBills.
   const page = (hasMore ? bills.slice(0, limit) : bills).map((b) => {
-    if (typeof b.items === 'string') { try { b.items = JSON.parse(b.items); } catch (_) { /* keep */ } }
-    return { ...b, kind: 'bill' };
+    let rawItems = [];
+    try { rawItems = Array.isArray(b.items) ? b.items : JSON.parse(b.items || '[]'); } catch (_) { rawItems = []; }
+    const billItems = (Array.isArray(rawItems) ? rawItems : []).map((it, ix) => ({
+      id: ix + 1, bill_id: b.id,
+      item_name: it.item_name || it.name || '', name: it.item_name || it.name || '',
+      quantity: it.quantity != null ? it.quantity : (it.qty != null ? it.qty : 1), qty: it.quantity != null ? it.quantity : (it.qty != null ? it.qty : 1),
+      unit: it.unit || '', unit_price: it.unit_price != null ? it.unit_price : (it.rate || 0), rate: it.unit_price != null ? it.unit_price : (it.rate || 0),
+      amount: it.amount != null ? it.amount : ((it.quantity || it.qty || 1) * (it.unit_price || it.rate || 0)),
+      is_cut: !!it.is_cut, position: ix }));
+    const total = Number(b.total), joma = Number(b.joma), baki = Number(b.baki);
+    return { ...b, kind: 'bill', items: billItems,
+      bill_number: b.bill_no,
+      total, joma, baki, paid_so_far: joma, remaining: baki,
+      plus_amount: Math.max(0, joma - total),
+      payment_status: baki <= 0 ? 'paid' : (joma > 0 ? 'partial' : 'due'), payments: [] };
   });
   const [pays] = await pool.execute(
     `SELECT * FROM payments ${where} ORDER BY id DESC LIMIT ?`, [...qargs, limit]
   );
   const payments = pays.map((p) => ({ ...p, kind: 'payment' }));
   const next_before_id = hasMore ? page[page.length - 1].id : null;
-  return { bills: page, payments, next_before_id };
+  return { ok: true, bills: page, payments, total: page.length, next_before_id };
 }
 
 // Customer baki rollup shared by getKhata / getBakiOverview.
@@ -505,7 +523,7 @@ async function customerBakiRows(userId) {
             COALESCE((SELECT SUM(b.total) FROM bills b WHERE b.customer_id = c.id AND b.user_id = c.user_id), 0) AS total_billed,
             COALESCE((SELECT SUM(b.joma) FROM bills b WHERE b.customer_id = c.id AND b.user_id = c.user_id), 0) AS bills_joma,
             COALESCE((SELECT SUM(b.baki) FROM bills b WHERE b.customer_id = c.id AND b.user_id = c.user_id), 0) AS bills_baki,
-            COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.customer_id = c.id AND p.user_id = c.user_id), 0) AS paid,
+            COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.customer_id = c.id AND p.user_id = c.user_id AND (p.note IS NULL OR p.note <> 'Bill payment')), 0) AS paid,
             (SELECT MAX(b.created_at) FROM bills b WHERE b.customer_id = c.id AND b.user_id = c.user_id) AS last_activity,
             (SELECT MAX(b.created_at) FROM bills b WHERE b.customer_id = c.id AND b.user_id = c.user_id AND b.baki > 0) AS last_due_at,
             (SELECT MIN(b.created_at) FROM bills b WHERE b.customer_id = c.id AND b.user_id = c.user_id AND b.baki > 0) AS oldest_due_at,
@@ -516,7 +534,16 @@ async function customerBakiRows(userId) {
   return rows.map((r) => {
     const totalBilled = Number(r.total_billed);
     const paidSoFar = Number(r.bills_joma) + Number(r.paid);
-    const due = Number(r.bills_baki) - Number(r.paid);
+    // Balance truth (fix 2026-10-21): recordPayment writes the SAME money
+    // into bills.joma AND a payments row (note 'Bill payment'); those rows
+    // are excluded in the SQL above, so nothing is counted twice. Before
+    // this fix paid_so_far double-counted recordPayment money (a Rs.300
+    // payment showed as Rs.600 paid) and amount_due was double-subtracted
+    // (Rs.700 true baki showed as Rs.400) or went negative (bappa: -50).
+    // due / plus now come from the single balance: billed - paid.
+    const balance = totalBilled - paidSoFar;
+    const due = Math.max(0, balance);
+    const plus = Math.max(0, -balance);
     let daysOverdue = 0;
     if (due > 0 && r.oldest_due_at) {
       daysOverdue = Math.max(0, Math.floor((Date.now() - new Date(r.oldest_due_at).getTime()) / 86400000));
@@ -532,6 +559,7 @@ async function customerBakiRows(userId) {
       total_billed: totalBilled, total_business: totalBilled, total: totalBilled,
       paid_so_far: paidSoFar, paid: paidSoFar,
       total_baki: due, amount_due: due, total_due: due, baki: due,
+      plus_amount: plus, plus: plus,
       days_overdue: daysOverdue,
     };
   });
@@ -542,22 +570,28 @@ async function hGetKhata(req) {
   const customers = await customerBakiRows(user.id);
   customers.sort((a, b) => b.total_baki - a.total_baki);
   const total_due = customers.reduce((s, c) => s + Math.max(0, c.total_baki), 0);
-  return { customers, total_due };
+  const total_plus = customers.reduce((s, c) => s + (c.plus_amount || 0), 0);
+  return { ok: true, customers, total_due, total_plus };
 }
 
 async function hGetBakiOverview(req, args) {
   const { user } = needAuth(await authUser(req));
   const page = Math.max(parseInt(args.page, 10) || 1, 1);
   const pageSize = Math.min(Math.max(parseInt(args.page_size, 10) || 50, 1), 200);
-  const all = (await customerBakiRows(user.id)).filter((c) => c.total_baki > 0);
-  all.sort((a, b) => b.total_baki - a.total_baki);
+  // Fix 2026-10-21: plus (overpaid) customers were filtered out completely,
+  // so Total Baki showed '0 customers / No customer baki' while a customer
+  // had paid extra (B74 case: paid Rs.20,000 on a Rs.1,958 bill).
+  const all = (await customerBakiRows(user.id)).filter((c) => c.total_baki > 0 || (c.plus_amount || 0) > 0);
+  all.sort((a, b) => (b.total_baki - a.total_baki) || ((b.plus_amount || 0) - (a.plus_amount || 0)));
   const total_baki = all.reduce((s, c) => s + c.total_baki, 0);
+  const total_plus = all.reduce((s, c) => s + (c.plus_amount || 0), 0);
   const start = (page - 1) * pageSize;
   return {
     ok: true,
     customers: all.slice(start, start + pageSize),
     total_baki,
     total_due: total_baki,
+    total_plus,
     total_customers: all.length,
     page,
     page_size: pageSize,
@@ -917,7 +951,7 @@ async function hListBillsDirect(req, args) {
         bill_number: r.bill_no, mobile: r.customer_mobile,
         subtotal: Number(r.subtotal), discount: Number(r.discount), gst_amount: Number(r.gst_amount),
         total, joma, baki, paid_so_far: joma, remaining: baki,
-        payment_status: baki <= 0 ? 'paid' : (joma > 0 ? 'partial' : 'due'), payments: [] };
+        payment_status: baki <= 0 ? 'paid' : (joma > 0 ? 'partial' : 'due'), payments: [], plus_amount: Math.max(0, joma - total) };
     });
     return { ok: true, items, bills: items, total: items.length };
   } catch (_) { return { ok: true, items: [], bills: [], total: 0 }; }
@@ -944,19 +978,42 @@ async function hListCustomersDirectoryDirect(req, args) {
   const { user } = needAuth(await authUser(req));
   // v21: rows carried only id/name/mobile — the Customers screen showed
   // 'Invalid Date' and Rs.NaN everywhere. Full balance rows now.
+  // Fix 2026-10-21: the screen's big count reads period_customer_count and
+  // all_time_customer_count — neither was returned, so it always showed
+  // 'Total customers 0 / All-time total: 0'. The period filter was also
+  // ignored and there was no pagination / has_more. All fixed below; every
+  // legacy field is kept.
   const q = String((args && args.query) || '').trim().toLowerCase();
   try {
     let rows = await customerBakiRows(user.id);
     if (q) rows = rows.filter((c) => (c.customer_name || '').toLowerCase().includes(q) || String(c.mobile || '').includes(q));
+    const allTimeCount = rows.length;
+    const periodStart = args && args.period_start_ms != null ? Number(args.period_start_ms) : null;
+    let periodRows = rows;
+    if (periodStart && Number.isFinite(periodStart)) {
+      periodRows = rows.filter((c) => {
+        const t = new Date(c.joined_at || c.created_at || 0).getTime();
+        return Number.isFinite(t) && t >= periodStart;
+      });
+    }
     const sort = String((args && args.sort) || 'recent');
-    if (sort === 'name') rows.sort((a, b) => String(a.customer_name).localeCompare(String(b.customer_name)));
-    else if (sort === 'due') rows.sort((a, b) => b.amount_due - a.amount_due);
-    else rows.sort((a, b) => new Date(b.last_activity_at || b.created_at || 0) - new Date(a.last_activity_at || a.created_at || 0));
-    const totalBaki = rows.reduce((s2, c) => s2 + Math.max(0, c.amount_due), 0);
-    return { ok: true, items: rows, customers: rows, total: rows.length,
-             total_customers: rows.length, all_time_total: rows.reduce((s2, c) => s2 + c.total_billed, 0),
-             total_baki: totalBaki, total_due: totalBaki };
-  } catch (_) { return { ok: true, items: [], customers: [], total: 0, total_customers: 0 }; }
+    if (sort === 'name') periodRows.sort((a, b) => String(a.customer_name).localeCompare(String(b.customer_name)));
+    else if (sort === 'due' || sort === 'baki') periodRows.sort((a, b) => b.amount_due - a.amount_due);
+    else periodRows.sort((a, b) => new Date(b.last_activity_at || b.created_at || 0) - new Date(a.last_activity_at || a.created_at || 0));
+    const page = Math.max(parseInt(args && args.page, 10) || 1, 1);
+    const pageSize = Math.min(Math.max(parseInt(args && args.page_size, 10) || 50, 1), 200);
+    const start = (page - 1) * pageSize;
+    const pageRows = periodRows.slice(start, start + pageSize);
+    const totalBaki = periodRows.reduce((s2, c) => s2 + Math.max(0, c.amount_due), 0);
+    const totalPlus = periodRows.reduce((s2, c) => s2 + (c.plus_amount || 0), 0);
+    return { ok: true, items: pageRows, customers: pageRows, total: periodRows.length,
+             total_customers: periodRows.length,
+             period_customer_count: periodRows.length,
+             all_time_customer_count: allTimeCount,
+             has_more: start + pageSize < periodRows.length,
+             all_time_total: rows.reduce((s2, c) => s2 + c.total_billed, 0),
+             total_baki: totalBaki, total_due: totalBaki, total_plus: totalPlus };
+  } catch (_) { return { ok: true, items: [], customers: [], total: 0, total_customers: 0, period_customer_count: 0, all_time_customer_count: 0, has_more: false }; }
 }
 async function hFindCustomersDirect(req, args) {
   const { user } = needAuth(await authUser(req));
