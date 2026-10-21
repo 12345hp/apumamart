@@ -101,8 +101,13 @@ app.use((req, res, next) => {
   next();
 });
 
-// JSON body parsing
-app.use(express.json({ limit: '2mb' }));
+// JSON body parsing. The verify hook stashes the exact raw bytes on
+// req.rawBody: the Razorpay webhook signature is HMAC over the raw body,
+// so it can never be checked against re-serialized parsed JSON.
+app.use(express.json({
+  limit: '2mb',
+  verify: (req, res, buf) => { req.rawBody = buf; },
+}));
 
 // Request timeout: clean JSON 503 instead of a hanging socket.
 app.use((req, res, next) => {
