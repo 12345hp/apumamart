@@ -723,10 +723,31 @@ async function posCartPayload(pool, userId, counterId) {
   return { items, total: Math.round(total * 100) / 100, count };
 }
 
+// Cart calls from the app carry counter_id = the selected counter's id, but
+// on the direct New-sale path (before a counter tile is tapped, while the
+// counters list is still loading) the app sends counter_id 0 / missing —
+// those adds used to land in an orphan "counter 0" cart that no panel ever
+// renders, so Add looked dead. Resolve here: a valid active counter id is
+// used as-is; anything else (0, missing, unknown) maps to the account's
+// FIRST active counter, the same cart the sale panel renders. Accounts
+// with no counters keep the legacy keying (nothing to map to).
+async function resolvePosCounterId(pool, userId, rawId) {
+  const want = parseInt(rawId, 10) || 0;
+  try {
+    const [rows] = await pool.execute(
+      'SELECT id FROM counters WHERE user_id = ? AND is_active = 1 ORDER BY id',
+      [userId]
+    );
+    if (!rows.length) return want;
+    if (rows.some(r => Number(r.id) === want)) return want;
+    return Number(rows[0].id);
+  } catch (_) { return want; }
+}
+
 async function hGetPosCounterCart(req, args) {
   const { user } = needAuth(await authUser(req));
   const pool = getPool();
-  const counterId = parseInt(args.counter_id, 10) || 0;
+  const counterId = await resolvePosCounterId(pool, user.id, args.counter_id);
   try {
     const cart = await posCartPayload(pool, user.id, counterId);
     return { ok: true, items: cart.items, products: [], total: cart.total, cart_total: cart.total, cart_items: cart.count };
@@ -1397,7 +1418,7 @@ async function hUnlockAppDirect(req, args) {
 async function hAdjustPosCounterCart(req, args) {
   const { user } = needAuth(await authUser(req));
   const pool = getPool();
-  const counterId = parseInt(args.counter_id, 10) || 0;
+  const counterId = await resolvePosCounterId(pool, user.id, args.counter_id);
   const productId = parseInt(args.product_id, 10) || 0;
   const delta = Number(args.delta) || 0;
   try {
@@ -1447,7 +1468,7 @@ async function hCheckoutPosSale(req, args) {
 async function hClearPosCounterCart(req, args) {
   const { user } = needAuth(await authUser(req));
   const pool = getPool();
-  const counterId = parseInt(args.counter_id, 10) || 0;
+  const counterId = await resolvePosCounterId(pool, user.id, args.counter_id);
   try {
     await pool.execute('DELETE FROM pos_counter_carts WHERE user_id = ? AND counter_id = ?', [user.id, counterId]);
   } catch (_) {}
