@@ -242,11 +242,13 @@ function msg91Get(path) {
     if (!authkey) { reject(new Error('MSG91_AUTH_KEY not configured')); return; }
     const sep = path.includes('?') ? '&' : '?';
     const url = `https://control.msg91.com${path}${sep}authkey=${encodeURIComponent(authkey)}`;
-    https.get(url, (res) => {
+    const r = https.get(url, (res) => {
       let data = '';
       res.on('data', (c) => data += c);
       res.on('end', () => { try { resolve(JSON.parse(data)); } catch (_) { resolve({ raw: data }); } });
-    }).on('error', reject);
+    });
+    r.on('error', reject);
+    r.setTimeout(10000, () => r.destroy(new Error('MSG91 timeout')));
   });
 }
 
@@ -759,7 +761,9 @@ async function hListBillsDirect(req, args) {
        WHERE ${where.join(' AND ')} ORDER BY b.id DESC LIMIT ${limit}`, params);
     const items = rows.map((r) => {
       let rawItems = [];
-      try { rawItems = JSON.parse(r.items || '[]'); } catch (_) { rawItems = []; }
+      // mysql2 returns JSON columns already parsed (an array) — handle both
+      // shapes; the old JSON.parse(array) threw and items silently became [].
+      try { rawItems = Array.isArray(r.items) ? r.items : JSON.parse(r.items || '[]'); } catch (_) { rawItems = []; }
       const billItems = (Array.isArray(rawItems) ? rawItems : []).map((it, ix) => ({
         id: ix + 1, bill_id: r.id,
         item_name: it.item_name || it.name || '', name: it.item_name || it.name || '',
@@ -892,7 +896,24 @@ async function hSaveBillDirect(req, args) {
       return { name, qty: 1, rate: amount, amount };
     });
   }
-  const total = Number(args.total || args.round_total || 0);
+  let total = Number(args.total || args.round_total || 0);
+  // OP1 ROOT FIX (2026-10-21): the Write-the-bill screen's round_total
+  // arrives as 0 in the real app flow (proven from stored rows B47/B49/B50:
+  // the parsed item lines WERE stored, with correct amounts, but total,
+  // subtotal and baki were all 0). When no usable total arrives but item
+  // lines exist, derive the total from the lines themselves — the data is
+  // already here; never store a ₹0 bill for a bill that has items.
+  // A positive total from either contract is never overridden.
+  if (total <= 0 && items.length) {
+    let derived = 0;
+    for (const it of items) {
+      const q = it.quantity != null ? Number(it.quantity) : (it.qty != null ? Number(it.qty) : 1);
+      const r = it.unit_price != null ? Number(it.unit_price) : Number(it.rate || 0);
+      const a = it.amount != null ? Number(it.amount) : (q || 0) * (r || 0);
+      if (Number.isFinite(a)) derived += a;
+    }
+    if (derived > 0) total = derived;
+  }
   const joma = Number(args.joma != null ? args.joma : (args.paid != null ? args.paid : (args.paid_amount || 0)));
   const subtotal = Number(args.subtotal || total);
   const discount = Number(args.discount || 0);
@@ -1947,11 +1968,26 @@ async function hUpdateBranchManager(req, args) {
   const pool = getPool();
   const branchId = parseInt(args.branch_id) || 0;
   if (!branchId) throw Object.assign(new Error('branch_id required'), { status: 400 });
-  // Verify ownership
+  // Verify ownership + load current manager identity and live token.
   const [own] = await pool.execute(
-    'SELECT id FROM branches WHERE id = ? AND owner_user_id = ?', [branchId, user.id]);
+    'SELECT id, manager_name, manager_mobile, access_token FROM branches WHERE id = ? AND owner_user_id = ?', [branchId, user.id]);
   if (!own.length) throw Object.assign(new Error('Branch not found'), { status: 404 });
-  // Invalidate old token, generate new one — old manager locked out forever
+  // LINK STABILITY (Admin's rule, 2026-10-21): the manager link must NEVER
+  // die while the manager is the same person. If the submitted name
+  // (trim, case-insensitive) and mobile (last 10 digits) match what is
+  // already saved, this call changes NOTHING — no token rotation, no
+  // session deletion, no identity sync — and returns the existing link.
+  const curName = String(own[0].manager_name || '').trim().toLowerCase();
+  const curMob = String(own[0].manager_mobile || '').replace(/\D/g, '').slice(-10);
+  const newNameCmp = String(args.manager_name || '').trim().toLowerCase();
+  const newMobCmp = String(args.manager_mobile || '').replace(/\D/g, '').slice(-10);
+  if (curName === newNameCmp && curMob === newMobCmp) {
+    return { ok: true, unchanged: true, branch_id: branchId,
+             access_token: own[0].access_token,
+             manager_link: '/branch.html?token=' + own[0].access_token };
+  }
+  // Manager truly changed: invalidate old token, generate new one — the
+  // old manager is locked out forever.
   const newToken = genBranchToken();
   await pool.execute(
     `UPDATE branches SET manager_name = ?, manager_mobile = ?,
@@ -2710,7 +2746,372 @@ async function hVerifyWebSubscription(req, args) {
        expires_at = VALUES(expires_at), updated_at = NOW()`,
     [user.id, plan.tier, planId, expires]
   );
+  // Referral reward: if this buyer was referred, give the referrer 1 free
+  // month. maybeRewardReferrer is fully self-guarded — it can never break
+  // or block this payment activation.
+  await maybeRewardReferrer(pool, user.id);
   return { ok: true };
+}
+
+// ---------------------------------------------------------------------------
+// Referrals (2026-10-21): "bring a shop, get 1 month free".
+// A user shares their code (getMyReferral). A NEW user (account at most
+// 7 days old) attaches it with applyReferralCode. When the referred user
+// FIRST pays for a plan (verifyWebSubscription success path above), the
+// referrer's subscription expiry is extended by 30 days and the referral
+// row is marked rewarded.
+// ---------------------------------------------------------------------------
+async function ensureReferralCode(pool, userId) {
+  const [rows] = await pool.execute('SELECT code FROM referral_codes WHERE user_id = ? LIMIT 1', [userId]);
+  if (rows.length && rows[0].code) return rows[0].code;
+  const alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+  const bytes = crypto.randomBytes(4);
+  let suffix = '';
+  for (let i = 0; i < 4; i++) suffix += alphabet[bytes[i] % alphabet.length];
+  const code = 'APUMA-' + userId + '-' + suffix;
+  await pool.execute(
+    'INSERT INTO referral_codes (user_id, code) VALUES (?, ?) ON DUPLICATE KEY UPDATE code = code',
+    [userId, code]
+  );
+  const [again] = await pool.execute('SELECT code FROM referral_codes WHERE user_id = ? LIMIT 1', [userId]);
+  return again.length ? again[0].code : code;
+}
+
+async function hGetMyReferral(req, args) {
+  const { user } = needAuth(await authUser(req));
+  const pool = getPool();
+  const code = await ensureReferralCode(pool, user.id);
+  const [joined] = await pool.execute('SELECT COUNT(*) AS c FROM referrals WHERE referrer_user_id = ?', [user.id]);
+  const [earned] = await pool.execute('SELECT COUNT(*) AS c FROM referrals WHERE referrer_user_id = ? AND rewarded = 1', [user.id]);
+  return { ok: true, code, joined: Number(joined[0].c) || 0, reward_months: Number(earned[0].c) || 0 };
+}
+
+async function hApplyReferralCode(req, args) {
+  const { user } = needAuth(await authUser(req));
+  const code = String(args.code || '').trim().toUpperCase().slice(0, 40);
+  if (!code) return { ok: false, error: 'Please enter a referral code' };
+  const pool = getPool();
+  const [owner] = await pool.execute('SELECT user_id FROM referral_codes WHERE code = ? LIMIT 1', [code]);
+  if (!owner.length) return { ok: false, error: 'This referral code is not valid' };
+  const referrerId = owner[0].user_id;
+  if (referrerId === user.id) return { ok: false, error: 'You cannot use your own referral code' };
+  const [existing] = await pool.execute('SELECT id FROM referrals WHERE referred_user_id = ? LIMIT 1', [user.id]);
+  if (existing.length) return { ok: false, error: 'A referral code is already added to your account' };
+  const [me] = await pool.execute('SELECT created_at FROM users WHERE id = ?', [user.id]);
+  if (me.length && me[0].created_at) {
+    const ageDays = (Date.now() - new Date(me[0].created_at).getTime()) / 86400000;
+    if (ageDays > 7) return { ok: false, error: 'Referral codes can be added only within 7 days of signing up' };
+  }
+  await pool.execute(
+    'INSERT INTO referrals (referrer_user_id, referred_user_id, code) VALUES (?,?,?)',
+    [referrerId, user.id, code]
+  );
+  return { ok: true, message: 'Referral added. When you buy any premium plan, your friend gets 1 month free.' };
+}
+
+// ---------------------------------------------------------------------------
+// Shop reviews (2026-10-21): real users submit a rating + text. Nothing is
+// public until the owner/admin approves it (approved=1). No fake reviews
+// are ever seeded — an empty public list is the honest starting state.
+// ---------------------------------------------------------------------------
+async function hSubmitReview(req, args) {
+  const { user } = needAuth(await authUser(req));
+  const rating = Math.floor(Number(args.rating));
+  if (!rating || rating < 1 || rating > 5) {
+    return { ok: false, error: 'Please give a star rating between 1 and 5' };
+  }
+  const text = String(args.text || '').trim().slice(0, 1000);
+  if (!text) return { ok: false, error: 'Please write a few words' };
+  const pool = getPool();
+  await pool.execute(
+    'INSERT INTO reviews (user_id, shop_name, reviewer_name, rating, text, approved) VALUES (?,?,?,?,?,0)',
+    [user.id, user.business_name || null, user.name || null, rating, text]
+  );
+  return { ok: true, message: 'Thanks — your review will appear after a quick check.' };
+}
+
+async function hListApprovedReviews(req, args) {
+  // Public: only owner-approved reviews, newest first.
+  const pool = getPool();
+  try {
+    const [rows] = await pool.execute(
+      'SELECT id, shop_name, reviewer_name, rating, text, created_at FROM reviews WHERE approved = 1 ORDER BY id DESC LIMIT 50'
+    );
+    return { ok: true, reviews: rows };
+  } catch (_) {
+    return { ok: true, reviews: [] };
+  }
+}
+
+function needOwnerOrAdmin(user) {
+  if (user.role !== 'owner' && user.role !== 'admin') {
+    const e = new Error('only owner/admin can do this');
+    e.status = 403;
+    throw e;
+  }
+}
+
+async function hListPendingReviews(req, args) {
+  const { user } = needAuth(await authUser(req));
+  needOwnerOrAdmin(user);
+  const pool = getPool();
+  const [rows] = await pool.execute(
+    'SELECT id, user_id, shop_name, reviewer_name, rating, text, created_at FROM reviews WHERE approved = 0 ORDER BY id DESC LIMIT 100'
+  );
+  return { ok: true, reviews: rows };
+}
+
+async function hApproveReview(req, args) {
+  const { user } = needAuth(await authUser(req));
+  needOwnerOrAdmin(user);
+  const id = Math.floor(Number(args.id));
+  if (!id) return { ok: false, error: 'review id required' };
+  await getPool().execute('UPDATE reviews SET approved = 1 WHERE id = ?', [id]);
+  return { ok: true };
+}
+
+async function hRejectReview(req, args) {
+  const { user } = needAuth(await authUser(req));
+  needOwnerOrAdmin(user);
+  const id = Math.floor(Number(args.id));
+  if (!id) return { ok: false, error: 'review id required' };
+  await getPool().execute('DELETE FROM reviews WHERE id = ?', [id]);
+  return { ok: true };
+}
+
+async function hGetMonthlyReport(req, args) {
+  // Monthly report (2026-10-21): read-only aggregates over the caller's own
+  // data. Jama follows the v21 rule (paid = bills.joma + payments.amount);
+  // current baki follows the same v21 due formula (bills.baki - payments).
+  const { user } = needAuth(await authUser(req));
+  const pool = getPool();
+  const now = new Date();
+  let year = Math.floor(Number(args.year)) || now.getFullYear();
+  let month = Math.floor(Number(args.month)) || (now.getMonth() + 1);
+  if (month < 1 || month > 12) month = now.getMonth() + 1;
+  if (year < 2000 || year > 2100) year = now.getFullYear();
+  async function one(sql, params, key) {
+    try {
+      const [rows] = await pool.execute(sql, params);
+      return Number(rows[0] && rows[0][key]) || 0;
+    } catch (_) { return 0; }
+  }
+  const total_sales = await one(
+    'SELECT COALESCE(SUM(total),0) AS v FROM bills WHERE user_id = ? AND YEAR(created_at) = ? AND MONTH(created_at) = ?',
+    [user.id, year, month], 'v');
+  const bill_count = await one(
+    'SELECT COUNT(*) AS v FROM bills WHERE user_id = ? AND YEAR(created_at) = ? AND MONTH(created_at) = ?',
+    [user.id, year, month], 'v');
+  const joma_bills = await one(
+    'SELECT COALESCE(SUM(joma),0) AS v FROM bills WHERE user_id = ? AND YEAR(created_at) = ? AND MONTH(created_at) = ?',
+    [user.id, year, month], 'v');
+  const joma_payments = await one(
+    'SELECT COALESCE(SUM(amount),0) AS v FROM payments WHERE user_id = ? AND YEAR(created_at) = ? AND MONTH(created_at) = ?',
+    [user.id, year, month], 'v');
+  const baki_bills = await one(
+    'SELECT COALESCE(SUM(baki),0) AS v FROM bills WHERE user_id = ?',
+    [user.id], 'v');
+  const paid_all = await one(
+    'SELECT COALESCE(SUM(amount),0) AS v FROM payments WHERE user_id = ?',
+    [user.id], 'v');
+  const new_customers = await one(
+    'SELECT COUNT(*) AS v FROM customers WHERE user_id = ? AND YEAR(created_at) = ? AND MONTH(created_at) = ?',
+    [user.id, year, month], 'v');
+  let top_customers = [];
+  try {
+    const [rows] = await pool.execute(
+      `SELECT c.name AS name, c.mobile AS mobile, COALESCE(SUM(b.total),0) AS billed
+       FROM bills b LEFT JOIN customers c ON c.id = b.customer_id
+       WHERE b.user_id = ? AND YEAR(b.created_at) = ? AND MONTH(b.created_at) = ?
+       GROUP BY b.customer_id, c.name, c.mobile
+       ORDER BY billed DESC LIMIT 5`,
+      [user.id, year, month]);
+    top_customers = rows.map((r) => ({ name: r.name || 'Cash', mobile: r.mobile || null, billed: Number(r.billed) || 0 }));
+  } catch (_) { top_customers = []; }
+  return {
+    ok: true,
+    year, month,
+    total_sales,
+    bill_count,
+    total_jama: joma_bills + joma_payments,
+    total_baki: Math.max(0, baki_bills - paid_all),
+    top_customers,
+    new_customers,
+  };
+}
+
+async function hSubmitPartnerApplication(req, args) {
+  // Area partner program (2026-10-21): a public application form — the
+  // applicant has no ApumaMart account, so no auth. Basic validation only;
+  // applications are read by the owner/admin via listPartnerApplications.
+  const name = String(args.name || '').trim().slice(0, 100);
+  const mobile = String(args.mobile || '').replace(/\D/g, '').slice(-10);
+  const area = String(args.area || '').trim().slice(0, 150);
+  const message = String(args.message || '').trim().slice(0, 1000);
+  if (!name) return { ok: false, error: 'Apna naam likho' };
+  if (mobile.length !== 10) return { ok: false, error: 'Sahi 10-digit mobile number likho' };
+  if (!area) return { ok: false, error: 'Apna area / sheher likho' };
+  await getPool().execute(
+    'INSERT INTO partner_applications (name, mobile, area, message) VALUES (?,?,?,?)',
+    [name, mobile, area, message || null]
+  );
+  return { ok: true, message: 'Dhanyavaad! Aapki application mil gayi hai. Hum jald sampark karenge.' };
+}
+
+async function hListPartnerApplications(req, args) {
+  const { user } = needAuth(await authUser(req));
+  needOwnerOrAdmin(user);
+  const [rows] = await getPool().execute(
+    'SELECT id, name, mobile, area, message, created_at FROM partner_applications ORDER BY id DESC LIMIT 200'
+  );
+  return { ok: true, applications: rows };
+}
+
+function googleTokenInfo(idToken) {
+  // Verify a Google ID token via Google's tokeninfo endpoint.
+  // Resolves to the parsed token info, or null on any failure.
+  return new Promise((resolve) => {
+    try {
+      const https = require('https');
+      const r = https.get('https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(idToken), (res) => {
+        let raw = '';
+        res.on('data', (c) => { raw += c; });
+        res.on('end', () => {
+          if (res.statusCode !== 200) return resolve(null);
+          try { resolve(JSON.parse(raw)); } catch (_) { resolve(null); }
+        });
+      });
+      r.on('error', () => resolve(null));
+      r.setTimeout(10000, () => { try { r.destroy(); } catch (_) {} resolve(null); });
+    } catch (_) { resolve(null); }
+  });
+}
+
+async function hGoogleAuth(req, args) {
+  // Google one-tap login — PREPARED 2026-10-21 (Phase 3 item 16), not yet
+  // switched on. Until the owner creates a Google OAuth client and sets
+  // GOOGLE_CLIENT_ID in the server environment, this returns a friendly
+  // "not set up" message and changes nothing. When configured: the ID
+  // token is verified with Google, the audience must match OUR client id,
+  // the user is found-or-created by google_sub / email, and a normal
+  // session is issued exactly like password login (same sessions table,
+  // same token format, same response shape as authOkBody). Fully wrapped
+  // in try-catch — it can never break the existing login paths.
+  try {
+    const clientId = process.env.GOOGLE_CLIENT_ID;
+    if (!clientId) return { ok: false, message: 'Google login is not set up yet' };
+    const idToken = String(args.id_token || args.credential || '');
+    if (!idToken) return { ok: false, message: 'Google token missing' };
+    const info = await googleTokenInfo(idToken);
+    if (!info || String(info.aud || '') !== String(clientId) || !info.sub) {
+      return { ok: false, message: 'Google login failed' };
+    }
+    if (!(info.email_verified === 'true' || info.email_verified === true)) {
+      return { ok: false, message: 'Google email is not verified' };
+    }
+    const email = String(info.email || '').trim().toLowerCase().slice(0, 190);
+    if (!email) return { ok: false, message: 'Google account has no email' };
+    const sub = String(info.sub).slice(0, 255);
+    const pool = getPool();
+    let [rows] = await pool.execute('SELECT * FROM users WHERE google_sub = ? LIMIT 1', [sub]);
+    if (!rows.length) {
+      [rows] = await pool.execute('SELECT * FROM users WHERE email = ? LIMIT 1', [email]);
+      if (rows.length) {
+        await pool.execute('UPDATE users SET google_sub = ? WHERE id = ?', [sub, rows[0].id]);
+      }
+    }
+    let user = rows[0];
+    if (!user) {
+      // New Google user: same trial defaults as a normal signup (the trial
+      // is derived from created_at) and role 'staff' like every signup
+      // after the first. mobile is NOT NULL + UNIQUE in this schema and a
+      // Google account brings no mobile, so a stable synthetic placeholder
+      // is stored ('g' + hash of the Google sub): it can never collide
+      // with, or receive an OTP for, a real phone number.
+      const placeholder = 'g' + crypto.createHash('sha256').update(sub).digest('hex').slice(0, 19);
+      const name = String(info.name || '').slice(0, 100) || null;
+      const [ins] = await pool.execute(
+        "INSERT INTO users (name, mobile, role, email, google_sub) VALUES (?, ?, 'staff', ?, ?)",
+        [name, placeholder, email, sub]
+      );
+      const [fresh] = await pool.execute('SELECT * FROM users WHERE id = ?', [ins.insertId]);
+      user = fresh[0];
+    }
+    if (!user) return { ok: false, message: 'Google login failed' };
+    const token = crypto.randomBytes(32).toString('hex');
+    await pool.execute(
+      'INSERT INTO sessions (user_id, token_hash, expires_at) VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 30 DAY))',
+      [user.id, hashToken(token)]
+    );
+    const u = pubUser(user);
+    return { ok: true, token, session_token: token, user: u, account: { session_token: token, user: u } };
+  } catch (e) {
+    try { console.error('googleAuth failed (ignored):', e && e.message); } catch (_) {}
+    return { ok: false, message: 'Google login failed' };
+  }
+}
+
+async function hExportMyData(req, args) {
+  // Data download (2026-10-21): the caller's OWN data only — every section
+  // is filtered by the session user's id. Password/security hashes and
+  // branch access tokens are never included.
+  const { user } = needAuth(await authUser(req));
+  const pool = getPool();
+  const sections = {};
+  const counts = {};
+  async function grab(name, sql, params) {
+    try {
+      const [rows] = await pool.execute(sql, params);
+      sections[name] = rows;
+      counts[name] = rows.length;
+    } catch (_) {
+      sections[name] = [];
+      counts[name] = 0;
+    }
+  }
+  const [prof] = await pool.execute(
+    'SELECT id, name, mobile, role, business_name, business_address, business_phone, created_at FROM users WHERE id = ?',
+    [user.id]
+  );
+  sections.profile = prof[0] || {};
+  counts.profile = prof.length ? 1 : 0;
+  await grab('customers', 'SELECT * FROM customers WHERE user_id = ? ORDER BY id LIMIT 10000', [user.id]);
+  await grab('bills', 'SELECT * FROM bills WHERE user_id = ? ORDER BY id LIMIT 10000', [user.id]);
+  await grab('payments', 'SELECT * FROM payments WHERE user_id = ? ORDER BY id LIMIT 10000', [user.id]);
+  await grab('expenses', 'SELECT * FROM expenses WHERE user_id = ? ORDER BY id LIMIT 10000', [user.id]);
+  await grab('suppliers', 'SELECT * FROM suppliers WHERE user_id = ? ORDER BY id LIMIT 10000', [user.id]);
+  await grab('supplier_txns', 'SELECT * FROM supplier_txns WHERE user_id = ? ORDER BY id LIMIT 10000', [user.id]);
+  await grab('products', 'SELECT * FROM products WHERE user_id = ? ORDER BY id LIMIT 10000', [user.id]);
+  await grab('rate_cards', 'SELECT * FROM rate_cards WHERE user_id = ? ORDER BY id LIMIT 10000', [user.id]);
+  await grab('staff', 'SELECT * FROM pos_staff WHERE user_id = ? ORDER BY id LIMIT 10000', [user.id]);
+  await grab('branches', 'SELECT id, name, address, phone, manager_name, manager_mobile, token_active, created_at FROM branches WHERE owner_user_id = ? ORDER BY id LIMIT 1000', [user.id]);
+  await grab('subscription', 'SELECT * FROM user_subscriptions WHERE user_id = ? LIMIT 1', [user.id]);
+  return { ok: true, exported_at: new Date().toISOString(), counts, data: sections };
+}
+
+async function maybeRewardReferrer(pool, referredUserId) {
+  // Runs after a successful paid activation. Fully self-guarded: any
+  // failure is logged and swallowed so a payment is never affected.
+  try {
+    const [r] = await pool.execute(
+      'SELECT id, referrer_user_id FROM referrals WHERE referred_user_id = ? AND rewarded = 0 LIMIT 1',
+      [referredUserId]
+    );
+    if (!r.length) return;
+    const referrerId = r[0].referrer_user_id;
+    const [us] = await pool.execute('SELECT tier, plan_id FROM user_subscriptions WHERE user_id = ? LIMIT 1', [referrerId]);
+    const tier = (us[0] && us[0].tier) || 'fc';
+    const planId = (us[0] && us[0].plan_id) || 'fc_monthly';
+    await pool.execute(
+      `INSERT INTO user_subscriptions (user_id, tier, plan_id, expires_at)
+       VALUES (?,?,?, DATE_ADD(NOW(), INTERVAL 30 DAY))
+       ON DUPLICATE KEY UPDATE expires_at = DATE_ADD(GREATEST(expires_at, NOW()), INTERVAL 30 DAY), updated_at = NOW()`,
+      [referrerId, tier, planId]
+    );
+    await pool.execute('UPDATE referrals SET rewarded = 1 WHERE id = ?', [r[0].id]);
+  } catch (e) {
+    try { console.error('referral reward failed (ignored):', e && e.message); } catch (_) {}
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -3026,6 +3427,18 @@ const DIRECT = {
   getMySubscription: hGetMySubscription,
   createWebSubscriptionOrder: hCreateWebSubscriptionOrder,
   verifyWebSubscription: hVerifyWebSubscription,
+  getMyReferral: hGetMyReferral,
+  applyReferralCode: hApplyReferralCode,
+  exportMyData: hExportMyData,
+  submitReview: hSubmitReview,
+  listApprovedReviews: hListApprovedReviews,
+  listPendingReviews: hListPendingReviews,
+  approveReview: hApproveReview,
+  rejectReview: hRejectReview,
+  getMonthlyReport: hGetMonthlyReport,
+  googleAuth: hGoogleAuth,
+  submitPartnerApplication: hSubmitPartnerApplication,
+  listPartnerApplications: hListPartnerApplications,
   scanPaperBill: hScanPaperBill,
   // V6 WARRANTY FIX (2026-10-19): saved "future calculations" CRUD
   createFutureCalculation: hCreateFutureCalculation,
