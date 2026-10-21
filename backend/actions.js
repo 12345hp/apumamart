@@ -2998,7 +2998,7 @@ async function hGoogleAuth(req, args) {
   // same token format, same response shape as authOkBody). Fully wrapped
   // in try-catch — it can never break the existing login paths.
   try {
-    const clientId = process.env.GOOGLE_CLIENT_ID;
+    const clientId = process.env.GOOGLE_CLIENT_ID || '450338055757-143tr1fp5g6vsu1akclvjkqoacu83gjg.apps.googleusercontent.com';
     if (!clientId) return { ok: false, message: 'Google login is not set up yet' };
     const idToken = String(args.id_token || args.credential || '');
     if (!idToken) return { ok: false, message: 'Google token missing' };
