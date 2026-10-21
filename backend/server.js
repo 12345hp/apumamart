@@ -209,11 +209,13 @@ function msg91Get(path) {
     if (!authkey) { reject(new Error('MSG91_AUTH_KEY not configured')); return; }
     const sep = path.includes('?') ? '&' : '?';
     const url = `https://control.msg91.com${path}${sep}authkey=${encodeURIComponent(authkey)}`;
-    https.get(url, (res) => {
+    const r = https.get(url, (res) => {
       let data = '';
-      res.on('data', (c) => { data += c; });
+      res.on('data', (c) => data += c);
       res.on('end', () => { try { resolve(JSON.parse(data)); } catch (_) { resolve({ raw: data }); } });
-    }).on('error', reject);
+    });
+    r.on('error', reject);
+    r.setTimeout(10000, () => r.destroy(new Error('MSG91 timeout')));
   });
 }
 
