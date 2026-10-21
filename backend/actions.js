@@ -667,16 +667,132 @@ async function hGetPosAttendance(req, args) {
   }
 }
 
+// POS product shape (2026-10-21 fix): the app reads ONE product contract
+// everywhere (sale panel, products tab, online store). It multiplies
+// price by (1 + gst_percent/100), reads stock as stock_quantity and the
+// low-stock line as minimum_stock — but listPosProducts used to return
+// only { id, name, price, stock }, so gst_percent was undefined and the
+// sale panel rendered price * NaN = "₹NaN" with a blank stock line.
+// The DB columns are named cost / gst_pct / stock / low_stock_at, so map
+// them here, once. Legacy alias `stock` kept for older readers.
+function posProductShape(r) {
+  const price = Number(r.price) || 0;
+  const stock = Number(r.stock) || 0;
+  return {
+    id: r.id,
+    store_id: null,
+    name: r.name,
+    variant: null,
+    price,
+    cost_price: Number(r.cost) || 0,
+    gst_percent: Number(r.gst_pct) || 0,
+    barcode: r.barcode || null,
+    stock_quantity: stock,
+    minimum_stock: Number(r.low_stock_at) || 0,
+    expiry_date: null,
+    online_enabled: false,
+    image_url: null,
+    stock,
+    sku: r.sku || null
+  };
+}
+
+const POS_PRODUCT_COLS = 'id, name, sku, barcode, price, cost, gst_pct, stock, low_stock_at';
+
+// Server-side POS cart (pos_counter_carts table): whenever the app is
+// online it reads the live bill from getPosCounterCart, so the cart must
+// persist per (user, counter) — the old handlers were stubs that kept
+// nothing, which is why Add never produced a bill.
+async function posCartPayload(pool, userId, counterId) {
+  const [rows] = await pool.execute(
+    'SELECT c.quantity AS qty, p.id, p.name, p.sku, p.barcode, p.price, p.cost, p.gst_pct, p.stock, p.low_stock_at ' +
+    'FROM pos_counter_carts c JOIN products p ON p.id = c.product_id AND p.user_id = c.user_id ' +
+    'WHERE c.user_id = ? AND c.counter_id = ? ORDER BY c.id',
+    [userId, counterId]
+  );
+  let total = 0, count = 0;
+  const items = rows.map(r => {
+    const product = posProductShape(r);
+    const quantity = Number(r.qty) || 0;
+    const base = Math.round(product.price * quantity * 100) / 100;
+    const gstAmt = Math.round(base * product.gst_percent) / 100;
+    const amount = Math.round((base + gstAmt) * 100) / 100;
+    total += amount; count += quantity;
+    return { product, quantity, base_amount: base, gst_amount: gstAmt, amount };
+  });
+  return { items, total: Math.round(total * 100) / 100, count };
+}
+
 async function hGetPosCounterCart(req, args) {
   const { user } = needAuth(await authUser(req));
-  // Frontend expects data.products
-  return { ok: true, items: [], products: [], total: 0 };
+  const pool = getPool();
+  const counterId = parseInt(args.counter_id, 10) || 0;
+  try {
+    const cart = await posCartPayload(pool, user.id, counterId);
+    return { ok: true, items: cart.items, products: [], total: cart.total, cart_total: cart.total, cart_items: cart.count };
+  } catch (_) {
+    return { ok: true, items: [], products: [], total: 0 };
+  }
+}
+
+// POS counters (2026-10-21 fix): rows live in the counters table, but the
+// old hGetPosCounters always returned counters: [] and the old
+// configurePosCounters saved nothing — so the Dashboard never rendered a
+// counter tile and the Day-close Counter dropdown stayed empty. The app
+// reads { id, counter_number, cashier_name, cart_total, cart_items,
+// today_sales, today_bills } per counter. counter_number is the 1-based
+// position in id order; today_* count only bills stamped with this
+// counter's number/name inside the requested day window.
+async function posCountersPayload(pool, user, args) {
+  const [rows] = await pool.execute(
+    'SELECT id, name, cashier FROM counters WHERE user_id = ? AND is_active = 1 ORDER BY id',
+    [user.id]
+  );
+  const startMs = Number(args && args.day_start_ms) || 0;
+  const endMs = Number(args && args.day_end_ms) || 0;
+  const counters = [];
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    const num = i + 1;
+    let cartTotal = 0, cartItems = 0;
+    try {
+      const cart = await posCartPayload(pool, user.id, r.id);
+      cartTotal = cart.total; cartItems = cart.count;
+    } catch (_) {}
+    let todaySales = 0, todayBills = 0;
+    if (startMs && endMs) {
+      try {
+        const [t] = await pool.execute(
+          'SELECT COUNT(*) AS n, COALESCE(SUM(total),0) AS s FROM bills WHERE user_id = ? AND counter IN (?, ?) AND created_at >= FROM_UNIXTIME(?) AND created_at < FROM_UNIXTIME(?)',
+          [user.id, String(num), String(r.name || ''), Math.floor(startMs / 1000), Math.floor(endMs / 1000)]
+        );
+        todayBills = Number(t[0].n) || 0;
+        todaySales = Number(t[0].s) || 0;
+      } catch (_) {}
+    }
+    counters.push({
+      id: r.id,
+      name: r.name,
+      counter_number: num,
+      cashier_name: r.cashier || null,
+      cart_total: cartTotal,
+      cart_items: cartItems,
+      today_sales: todaySales,
+      today_bills: todayBills
+    });
+  }
+  return counters;
 }
 
 async function hGetPosCounters(req, args) {
   const { user } = needAuth(await authUser(req));
-  // Frontend expects data.counters (array) for the counter combobox
-  return { ok: true, items: [], counters: [], total: 0 };
+  const pool = getPool();
+  try {
+    const counters = await posCountersPayload(pool, user, args);
+    return { ok: true, items: counters, counters, total: counters.length };
+  } catch (_) {
+    return { ok: true, items: [], counters: [], total: 0 };
+  }
 }
 
 async function hListPosDayCloses(req, args) {
@@ -717,10 +833,10 @@ async function hListPosProducts(req, args) {
   const pool = getPool();
   try {
     const [rows] = await pool.execute(
-      'SELECT id, name, price, stock FROM products WHERE user_id = ? ORDER BY name LIMIT 500',
+      'SELECT ' + POS_PRODUCT_COLS + ' FROM products WHERE user_id = ? ORDER BY name LIMIT 500',
       [user.id]
     );
-    const items = rows.map(r => ({ id: r.id, name: r.name, price: Number(r.price) || 0, stock: r.stock || 0 }));
+    const items = rows.map(posProductShape);
     return { ok: true, items: items, products: items, total: items.length };
   } catch (_) {
     return { ok: true, items: [], products: [], total: 0 };
@@ -842,18 +958,28 @@ async function hSavePosProductDirect(req, args) {
   try {
     const name = String(args.name || '').slice(0, 200);
     if (!name) return { ok: false, error: 'name required' };
+    // 2026-10-21 fix: the app sends cost_price / gst_percent /
+    // stock_quantity / minimum_stock, but this handler used to read only
+    // args.stock — so stock was always stored as 0 and GST, cost, barcode
+    // and minimum stock were silently dropped. Accept the app's names
+    // first, legacy names as fallback; store into the real DB columns
+    // (cost / gst_pct / stock / low_stock_at).
     const price = Number(args.price) || 0;
-    const stock = Number(args.stock) || 0;
+    const cost = Number(args.cost_price != null ? args.cost_price : args.cost) || 0;
+    const gst = Number(args.gst_percent != null ? args.gst_percent : args.gst_pct) || 0;
+    const stock = Number(args.stock_quantity != null ? args.stock_quantity : args.stock) || 0;
+    const minStock = Number(args.minimum_stock != null ? args.minimum_stock : args.low_stock_at) || 0;
+    const barcode = args.barcode ? String(args.barcode).slice(0, 60) : null;
     if (args.id) {
       await pool.execute(
-        'UPDATE products SET name=?, price=?, stock=? WHERE id=? AND user_id=?',
-        [name, price, stock, args.id, user.id]
+        'UPDATE products SET name=?, price=?, cost=?, gst_pct=?, stock=?, low_stock_at=?, barcode=? WHERE id=? AND user_id=?',
+        [name, price, cost, gst, stock, minStock, barcode, args.id, user.id]
       );
       return { ok: true, id: args.id };
     }
     const [r] = await pool.execute(
-      'INSERT INTO products (user_id, name, price, stock) VALUES (?,?,?,?)',
-      [user.id, name, price, stock]
+      'INSERT INTO products (user_id, name, price, cost, gst_pct, stock, low_stock_at, barcode) VALUES (?,?,?,?,?,?,?,?)',
+      [user.id, name, price, cost, gst, stock, minStock, barcode]
     );
     return { ok: true, id: r.insertId };
   } catch (e) { return { ok: false, error: 'save failed' }; }
@@ -1184,7 +1310,31 @@ async function hTogglePosAttendanceDirect(req, args) {
 }
 async function hConfigurePosCountersDirect(req, args) {
   const { user } = needAuth(await authUser(req));
-  return { ok: true, saved: true };
+  const pool = getPool();
+  // 2026-10-21 fix: this used to return { saved: true } without storing
+  // anything. Now it really maintains the counters table: grow with new
+  // "Counter N" rows, shrink by deactivating extra rows (rows and their
+  // cashier names are never deleted).
+  let count = parseInt(args.count, 10) || 0;
+  if (count < 1) count = 1;
+  if (count > 10) count = 10;
+  try {
+    const [rows] = await pool.execute('SELECT id FROM counters WHERE user_id = ? ORDER BY id', [user.id]);
+    for (let i = 0; i < count; i++) {
+      if (rows[i]) {
+        await pool.execute('UPDATE counters SET is_active = 1 WHERE id = ? AND user_id = ?', [rows[i].id, user.id]);
+      } else {
+        await pool.execute('INSERT INTO counters (user_id, name, is_active) VALUES (?, ?, 1)', [user.id, 'Counter ' + (i + 1)]);
+      }
+    }
+    for (let i = count; i < rows.length; i++) {
+      await pool.execute('UPDATE counters SET is_active = 0 WHERE id = ? AND user_id = ?', [rows[i].id, user.id]);
+    }
+    const counters = await posCountersPayload(pool, user, args);
+    return { ok: true, saved: true, count, items: counters, counters, total: counters.length };
+  } catch (_) {
+    return { ok: true, saved: true };
+  }
 }
 async function hClosePosDayDirect(req, args) {
   const { user } = needAuth(await authUser(req));
@@ -1242,7 +1392,37 @@ async function hUnlockAppDirect(req, args) {
 
 async function hAdjustPosCounterCart(req, args) {
   const { user } = needAuth(await authUser(req));
-  return { ok: true, adjusted: true, items: [], products: [], total: 0 };
+  const pool = getPool();
+  const counterId = parseInt(args.counter_id, 10) || 0;
+  const productId = parseInt(args.product_id, 10) || 0;
+  const delta = Number(args.delta) || 0;
+  try {
+    if (productId && delta) {
+      const [own] = await pool.execute('SELECT id FROM products WHERE id = ? AND user_id = ?', [productId, user.id]);
+      if (own.length) {
+        const [cur] = await pool.execute(
+          'SELECT quantity FROM pos_counter_carts WHERE user_id = ? AND counter_id = ? AND product_id = ?',
+          [user.id, counterId, productId]
+        );
+        const q = Math.max(0, (cur.length ? Number(cur[0].quantity) || 0 : 0) + delta);
+        if (q <= 0) {
+          await pool.execute(
+            'DELETE FROM pos_counter_carts WHERE user_id = ? AND counter_id = ? AND product_id = ?',
+            [user.id, counterId, productId]
+          );
+        } else {
+          await pool.execute(
+            'INSERT INTO pos_counter_carts (user_id, counter_id, product_id, quantity) VALUES (?,?,?,?) ON DUPLICATE KEY UPDATE quantity = VALUES(quantity)',
+            [user.id, counterId, productId, q]
+          );
+        }
+      }
+    }
+    const cart = await posCartPayload(pool, user.id, counterId);
+    return { ok: true, adjusted: true, items: cart.items, products: [], total: cart.total, cart_total: cart.total, cart_items: cart.count };
+  } catch (_) {
+    return { ok: true, adjusted: true, items: [], products: [], total: 0 };
+  }
 }
 
 async function hCheckoutPosSale(req, args) {
@@ -1262,6 +1442,11 @@ async function hCheckoutPosSale(req, args) {
 
 async function hClearPosCounterCart(req, args) {
   const { user } = needAuth(await authUser(req));
+  const pool = getPool();
+  const counterId = parseInt(args.counter_id, 10) || 0;
+  try {
+    await pool.execute('DELETE FROM pos_counter_carts WHERE user_id = ? AND counter_id = ?', [user.id, counterId]);
+  } catch (_) {}
   return { ok: true, cleared: true, items: [], products: [], total: 0 };
 }
 
@@ -1406,6 +1591,16 @@ async function hSavePosUpiSettlement(req, args) {
 
 async function hSetPosCounterCashier(req, args) {
   const { user } = needAuth(await authUser(req));
+  const pool = getPool();
+  // 2026-10-21 fix: persist the cashier name on the counter row (was a
+  // no-op stub) so Dashboard tiles and the Day-close list show it.
+  const counterId = parseInt(args.counter_id, 10) || 0;
+  const cashier = String(args.cashier_name || '').slice(0, 100);
+  try {
+    if (counterId) {
+      await pool.execute('UPDATE counters SET cashier = ? WHERE id = ? AND user_id = ?', [cashier || null, counterId, user.id]);
+    }
+  } catch (_) {}
   return { ok: true, saved: true };
 }
 
