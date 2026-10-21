@@ -774,7 +774,11 @@ async function posCountersPayload(pool, user, args) {
       id: r.id,
       name: r.name,
       counter_number: num,
-      cashier_name: r.cashier || null,
+      // Contract: the app copies cashier_name into a text-input state and
+      // calls .trim() on it (Mall tools discount-cap form) — it must ALWAYS
+      // be a string; null here crashed the whole app ("Page could not open")
+      // for any account whose counter has no cashier set yet.
+      cashier_name: r.cashier ? String(r.cashier) : '',
       cart_total: cartTotal,
       cart_items: cartItems,
       today_sales: todaySales,
@@ -1803,7 +1807,7 @@ async function hGetPosFraudDashboard(req, args) {
       'SELECT staff_name AS cashier_name, max_discount_percent FROM pos_staff_discount_rules WHERE user_id = ? ORDER BY staff_name',
       [user.id]
     );
-    out.staff_rules = rules.map(r => ({ cashier_name: r.cashier_name, max_discount_percent: Number(r.max_discount_percent) || 0 }));
+    out.staff_rules = rules.map(r => ({ cashier_name: r.cashier_name == null ? '' : String(r.cashier_name), max_discount_percent: Number(r.max_discount_percent) || 0 }));
   } catch (_) {}
   try {
     const r = rng('created_at');
