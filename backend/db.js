@@ -492,6 +492,16 @@ const SCHEMA = [
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   INDEX idx_reviews_approved (approved, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+`CREATE TABLE IF NOT EXISTS pos_counter_carts (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  counter_id INT NOT NULL DEFAULT 0,
+  product_id INT NOT NULL,
+  quantity DECIMAL(12,3) NOT NULL DEFAULT 0,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_pos_cart (user_id, counter_id, product_id),
+  INDEX idx_pos_cart_user (user_id, counter_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 ];
 // Add columns to bills that didn't exist in the original schema.
 // MySQL has no ADD COLUMN IF NOT EXISTS, so check INFORMATION_SCHEMA first.
