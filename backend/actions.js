@@ -2974,6 +2974,40 @@ async function hCreateWebSubscriptionOrder(req, args) {
   };
 }
 
+// Shared paid-activation for web subscription orders: flips the order to
+// 'paid' and writes exactly the records getMySubscription reads. Used by
+// BOTH the browser verify path (hVerifyWebSubscription) and the Razorpay
+// webhook (hRazorpayWebhook), so a paid plan activates identically whichever
+// path runs first. Callers must check the order is not already 'paid'
+// before calling (idempotency guard).
+async function applyWebSubscriptionActivation(pool, orderRow, paymentId, planId, plan) {
+  await pool.execute(
+    `UPDATE web_subscription_orders SET razorpay_payment_id = ?, status = 'paid', paid_at = NOW()
+     WHERE id = ?`,
+    [paymentId, orderRow.id]
+  );
+  // Mark premium: reuse the subscriptions table so getMySubscription picks it up.
+  await pool.execute(
+    `INSERT INTO subscriptions (user_id, product_id, purchase_token, status)
+     VALUES (?,?,?, 'verified')`,
+    [orderRow.user_id, planId, paymentId]
+  );
+  // Track expiry per plan duration.
+  const expires = new Date();
+  expires.setMonth(expires.getMonth() + plan.months);
+  await pool.execute(
+    `INSERT INTO user_subscriptions (user_id, tier, plan_id, expires_at)
+     VALUES (?,?,?,?)
+     ON DUPLICATE KEY UPDATE tier = VALUES(tier), plan_id = VALUES(plan_id),
+       expires_at = VALUES(expires_at), updated_at = NOW()`,
+    [orderRow.user_id, plan.tier, planId, expires]
+  );
+  // Referral reward: if this buyer was referred, give the referrer 1 free
+  // month. maybeRewardReferrer is fully self-guarded — it can never break
+  // or block this payment activation.
+  await maybeRewardReferrer(pool, orderRow.user_id);
+}
+
 async function hVerifyWebSubscription(req, args) {
   const { user } = needAuth(await authUser(req));
   const orderId = String(args.razorpay_order_id || '');
@@ -3002,32 +3036,73 @@ async function hVerifyWebSubscription(req, args) {
     const e = new Error('order not found'); e.status = 404; throw e;
   }
   if (o[0].status === 'paid') return { ok: true }; // idempotent retry
-  await pool.execute(
-    `UPDATE web_subscription_orders SET razorpay_payment_id = ?, status = 'paid', paid_at = NOW()
-     WHERE id = ?`,
-    [paymentId, o[0].id]
-  );
-  // Mark premium: reuse the subscriptions table so getMySubscription picks it up.
-  await pool.execute(
-    `INSERT INTO subscriptions (user_id, product_id, purchase_token, status)
-     VALUES (?,?,?, 'verified')`,
-    [user.id, planId, paymentId]
-  );
-  // Track expiry per plan duration.
-  const expires = new Date();
-  expires.setMonth(expires.getMonth() + plan.months);
-  await pool.execute(
-    `INSERT INTO user_subscriptions (user_id, tier, plan_id, expires_at)
-     VALUES (?,?,?,?)
-     ON DUPLICATE KEY UPDATE tier = VALUES(tier), plan_id = VALUES(plan_id),
-       expires_at = VALUES(expires_at), updated_at = NOW()`,
-    [user.id, plan.tier, planId, expires]
-  );
-  // Referral reward: if this buyer was referred, give the referrer 1 free
-  // month. maybeRewardReferrer is fully self-guarded — it can never break
-  // or block this payment activation.
-  await maybeRewardReferrer(pool, user.id);
+  await applyWebSubscriptionActivation(pool, o[0], paymentId, planId, plan);
   return { ok: true };
+}
+
+// ---------------------------------------------------------------------------
+// Razorpay webhook: POST /api/actions/razorpay-webhook (server-to-server).
+// Razorpay calls this when a payment is captured or fails, so a paid plan
+// activates even if the customer closes the app before the browser verify
+// step runs. Signature = HMAC-SHA256 of the EXACT raw request body using
+// RAZORPAY_WEBHOOK_SECRET, sent in the X-Razorpay-Signature header. The raw
+// body is stashed by server.js (express.json verify hook) as req.rawBody —
+// parsed JSON is never re-serialized for the signature check.
+// The two 400 strings are distinct on purpose: 'webhook not configured'
+// means the secret env var is missing; 'invalid webhook signature' means
+// the secret IS set but the signature did not match. Neither exposes a value.
+// ---------------------------------------------------------------------------
+async function hRazorpayWebhook(req, res) {
+  try {
+    const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
+    if (!secret) {
+      return res.status(400).json({ ok: false, error: 'webhook not configured' });
+    }
+    const signature = String((req.headers && req.headers['x-razorpay-signature']) || '');
+    const raw = req.rawBody ? req.rawBody.toString('utf8') : '';
+    if (!signature || !raw) {
+      return res.status(400).json({ ok: false, error: 'invalid webhook signature' });
+    }
+    const expected = crypto.createHmac('sha256', secret).update(raw).digest('hex');
+    const a = Buffer.from(expected, 'utf8');
+    const b = Buffer.from(signature, 'utf8');
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      return res.status(400).json({ ok: false, error: 'invalid webhook signature' });
+    }
+    let evt = null;
+    try { evt = JSON.parse(raw); } catch (_) { evt = null; }
+    if (!evt || typeof evt.event !== 'string') {
+      return res.status(400).json({ ok: false, error: 'invalid webhook payload' });
+    }
+    if (evt.event === 'payment.captured') {
+      const entity = (evt.payload && evt.payload.payment && evt.payload.payment.entity) || {};
+      const orderId = String(entity.order_id || '');
+      const paymentId = String(entity.id || '');
+      if (orderId && paymentId) {
+        const pool = getPool();
+        const [o] = await pool.execute(
+          'SELECT id, user_id, plan_id, status FROM web_subscription_orders WHERE razorpay_order_id = ?',
+          [orderId]
+        );
+        if (!o.length) {
+          console.error('razorpay webhook: captured payment for unknown order', orderId);
+        } else if (o[0].status !== 'paid') {
+          const plan = WEB_PLANS[o[0].plan_id];
+          if (plan) {
+            await applyWebSubscriptionActivation(pool, o[0], paymentId, o[0].plan_id, plan);
+          }
+        }
+        // Already 'paid' (browser verify ran first, or a repeat delivery):
+        // acknowledge and change nothing — no double extension.
+      }
+    }
+    // payment.failed and every other valid event: acknowledge, change nothing.
+    return res.status(200).json({ ok: true });
+  } catch (e) {
+    try { console.error('razorpay webhook failed:', e && e.message); } catch (_) {}
+    // A webhook error must never crash the server; 500 lets Razorpay retry.
+    if (!res.headersSent) return res.status(500).json({ ok: false, error: 'webhook processing failed' });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -3750,6 +3825,10 @@ function unsupportedFallback(action) {
   if (action === 'watchPosProduct') return { ok: true, watching: false };
   return base;
 }
+
+// Razorpay webhook (server-to-server, not an {action, args} call).
+// Mounted on the actions router: full path /api/actions/razorpay-webhook.
+router.post('/razorpay-webhook', hRazorpayWebhook);
 
 router.post('/', async (req, res, next) => {
   try {
