@@ -1066,6 +1066,116 @@ async function hSavePosProductDirect(req, args) {
     return { ok: true, id: r.insertId };
   } catch (e) { return { ok: false, error: 'save failed' }; }
 }
+// BUG-2026-10-21-02: legacy raw-input fallback parser, aligned to the
+// "Write the bill" screen parser (bundle ZZe) so a raw-only save stores the
+// same math the screen showed: "100x100" = 100 x 100 = 10000 (item name
+// "Calculation"), "rice 2 kg x 250" = qty x rate, "rice 500" = trailing
+// amount, "100+200" = expression, "total + 3%" = % of the running sum.
+// Lines that cannot be understood keep the line with amount 0 — a line is
+// never silently dropped, and a boolean is never read as money anywhere.
+function parseRawBillLines(raw) {
+  const R2 = (v) => Math.round((v + Number.EPSILON) * 100) / 100;
+  const UNIT_RE = 'kg|kilograms?|g|grams?|l|ltr|liters?|litres?|ml|milliliters?|millilitres?';
+  const normUnit = (u) => {
+    if (!u) return null;
+    if (/^kg$|^kilograms?$/i.test(u)) return 'kg';
+    if (/^g(?:ram|rams)?$/i.test(u)) return 'g';
+    if (/^ml$|^milliliters?$|^millilitres?$/i.test(u)) return 'ml';
+    return 'l';
+  };
+  const qtyConv = (q, unit) => (unit === 'g' || unit === 'ml') ? q / 1000 : q;
+  const cleanName = (t) => String(t || '').replace(/^[+-]\s*/, '').replace(/\s*[-–—:]\s*$/, '').replace(/\s+/g, ' ').trim() || 'Item';
+  const items = [];
+  let runningPos = 0; // sum of positive amounts so far (mirrors screen Po for "total +/-N%" lines)
+  const addItem = (name, qty, rate, amount, unit) => {
+    const a = R2(amount);
+    const it = { name, qty, rate: R2(rate), amount: a };
+    if (unit) it.unit = unit;
+    items.push(it);
+    if (a > 0) runningPos = R2(runningPos + a);
+    return a;
+  };
+  const evalExpr = (s) => {
+    const r = s.replace(/(\d+(?:\.\d+)?)%/g, (m, p) => String(Number(p) / 100)).replace(/[xX×]/g, '*').replace(/÷/g, '/').replace(/\s+/g, '');
+    if (!/^(?:\d+(?:\.\d+)?)(?:[+\-*/]\d+(?:\.\d+)?)+$/.test(r)) return null;
+    const toks = r.match(/\d+(?:\.\d+)?|[+\-*/]/g);
+    if (!toks || toks.length < 3) return null;
+    const vals = [], ops = [];
+    const prec = (o) => (o === '*' || o === '/') ? 2 : 1;
+    const apply = () => {
+      const o = ops.pop(), b = vals.pop(), a = vals.pop();
+      if (o === undefined || a === undefined || b === undefined || (o === '/' && b === 0)) return false;
+      vals.push(o === '+' ? a + b : o === '-' ? a - b : o === '*' ? a * b : a / b);
+      return Number.isFinite(vals[vals.length - 1]);
+    };
+    for (const tk of toks) {
+      if (/^\d/.test(tk)) { vals.push(Number(tk)); continue; }
+      while (ops.length && prec(ops[ops.length - 1]) >= prec(tk)) { if (!apply()) return null; }
+      ops.push(tk);
+    }
+    while (ops.length) { if (!apply()) return null; }
+    return (vals.length === 1 && Number.isFinite(vals[0])) ? vals[0] : null;
+  };
+  const parseOne = (line, neg) => {
+    // Trailing percent adjustment: "... + 3%", "... - 5% off", "... + 3% gst"
+    let G = null, K = 0, Y = line;
+    const vm = line.match(/\s*([+-])\s*(\d+(?:\.\d+)?)%\s*(?:off|gst)?\s*$/i);
+    if (vm) { G = vm[1]; K = Number(vm[2]); Y = line.slice(0, vm.index).trim(); }
+    const adj = (amt) => G ? amt * (G === '-' ? 1 - K / 100 : 1 + K / 100) : amt;
+    const sgn = neg ? -1 : 1;
+    if (G && /^total$/i.test(Y)) {
+      const a = R2(Math.abs(runningPos) * K / 100 * (G === '-' ? -1 : 1)) * sgn;
+      addItem(G === '-' ? `Discount ${K}%` : `GST ${K}%`, 1, Math.abs(a), a);
+      return;
+    }
+    let m = Y.match(new RegExp(`^(.+?)\\s+(\\d+(?:\\.\\d+)?)\\s*(${UNIT_RE})?\\s*[xX×*]\\s*(\\d+(?:\\.\\d+)?)(%)?$`, 'i'));
+    if (m) { // named multiplication: "rice 2 kg x 250"
+      const qty = Number(m[2]); const unit = normUnit(m[3]); const rate = Number(m[4]) / (m[5] ? 100 : 1);
+      addItem(cleanName(m[1]), qty, rate, adj(qtyConv(qty, unit) * rate) * sgn, unit);
+      return;
+    }
+    m = Y.match(new RegExp(`^(\\d+(?:\\.\\d+)?)(%)?\\s*(${UNIT_RE})?(?:\\s+(.+?))?\\s*[xX×*]\\s*(\\d+(?:\\.\\d+)?)(%)?$`, 'i'));
+    if (m) { // leading multiplication: "100x100", "100 x 100"
+      const qty = Number(m[1]) / (m[2] ? 100 : 1); const unit = normUnit(m[3]); const rate = Number(m[5]) / (m[6] ? 100 : 1);
+      const nm = (m[4] || '').trim();
+      addItem(nm ? cleanName(nm) : 'Calculation', qty, rate, adj(qtyConv(qty, unit) * rate) * sgn, unit);
+      return;
+    }
+    m = Y.match(/^(\d+(?:\.\d+)?)%$/);
+    if (m && !G) { const v = Number(m[1]) / 100; addItem('Calculation', 1, v, adj(v) * sgn); return; }
+    m = Y.match(/^(\d+(?:\.\d+)?)\s*[/÷]\s*(\d+(?:\.\d+)?)$/);
+    if (m && Number(m[2]) !== 0) { const v = Number(m[1]) / Number(m[2]); addItem('Calculation', 1, v, adj(v) * sgn); return; }
+    const ev = evalExpr(Y.replace(/[–—]/g, '-'));
+    if (ev != null) { addItem('Calculation', 1, Math.abs(ev), adj(ev) * sgn); return; }
+    m = Y.match(/^(.*?)(-?\d+(?:\.\d+)?)\s*$/);
+    if (m) { // plain trailing amount: "rice 500" (historical behaviour)
+      const v = Number(m[2]);
+      addItem(cleanName(m[1]), 1, Math.abs(v), adj(Math.abs(v)) * ((neg || v < 0) ? -1 : 1));
+      return;
+    }
+    items.push({ name: line, qty: 0, rate: 0, amount: 0 }); // unparseable: kept, never dropped
+  };
+  for (const rawLine of String(raw).split(/\n+/)) {
+    let line = rawLine.replace(/~~.*?~~/g, ' ').replace(/\s+/g, ' ').trim(); // struck-through segments carry no money
+    if (!line) continue;
+    let neg = false;
+    if (/^-\s*/.test(line)) neg = true;
+    line = line.replace(/^[+-]\s*/, '').trim();
+    if (!line) continue;
+    const mk = line.match(/\s\+\s*(\d+(?:\.\d+)?)%\s*making(?:\s+charges?)?\s*$/i);
+    if (mk) { // "... + N% making charges": N% of the line it follows (or of the running sum for "total")
+      const pct = Number(mk[1]); const base = line.slice(0, mk.index).trim();
+      let baseSum;
+      if (/^total$/i.test(base)) baseSum = runningPos;
+      else { const before = items.length; parseOne(base, neg); baseSum = items.slice(before).reduce((s, it) => s + it.amount, 0); }
+      const w = R2(baseSum * pct / 100);
+      addItem(`Making ${pct}%`, 1, Math.abs(w), w);
+      continue;
+    }
+    parseOne(line, neg);
+  }
+  return items;
+}
 async function hSaveBillDirect(req, args) {
   const { user } = needAuth(await authUser(req));
   const pool = getPool();
@@ -1095,38 +1205,54 @@ async function hSaveBillDirect(req, args) {
       customer_id = ins.insertId;
     }
   }
-  let items = Array.isArray(args.items) ? args.items : [];
-  if (!items.length && args.raw_input) {
-    items = String(args.raw_input).split(/\n+/).map((ln) => ln.trim()).filter(Boolean).map((ln) => {
-      const m = ln.match(/(\d+(?:\.\d+)?)\s*$/);
-      const amount = m ? Number(m[1]) : 0;
-      const name = m ? ln.slice(0, m.index).trim() || ln : ln;
-      return { name, qty: 1, rate: amount, amount };
-    });
+  // BUG-2026-10-21-02 FIX (2026-10-22): ONE PARSER, ONE TOTAL. The
+  // "Write the bill" client now sends the money it already computed on
+  // screen — items[] + subtotal + discount + gst_amount + total +
+  // paid_amount (+ round_applied, a BOOLEAN) — and the server stores that
+  // contract after a consistency check instead of re-parsing raw text.
+  // round_total is NEVER read as money when it is a boolean (it is the
+  // client's round-off checkbox; Number(true) = 1 once created a ₹1-total
+  // hazard). A positive NUMERIC round_total is honoured only when no
+  // items/total contract was sent at all (ancient clients).
+  const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
+  const itemAmt = (it) => {
+    if (!it || typeof it !== 'object') return 0;
+    if (it.amount != null && Number.isFinite(Number(it.amount))) return Number(it.amount);
+    const q = it.quantity != null ? num(it.quantity) : (it.qty != null ? num(it.qty) : 1);
+    const r = it.unit_price != null ? num(it.unit_price) : num(it.rate);
+    return q * r;
+  };
+  let items = Array.isArray(args.items) ? args.items.filter((it) => it && typeof it === 'object') : [];
+  if (!items.length && args.raw_input) items = parseRawBillLines(args.raw_input);
+  const discount = Math.max(0, num(args.discount));
+  const gst_amount = Math.max(0, num(args.gst_amount != null ? args.gst_amount : args.gst));
+  const joma = num(args.joma != null ? args.joma : (args.paid != null ? args.paid : args.paid_amount));
+  const itemsPosSum = Math.round(items.reduce((s, it) => { const a = itemAmt(it); return a > 0 ? s + a : s; }, 0) * 100) / 100;
+  const itemsNetSum = Math.round(items.reduce((s, it) => s + itemAmt(it), 0) * 100) / 100;
+  const sentTotal = args.total != null ? num(args.total) : null;
+  const sentSubtotal = args.subtotal != null ? num(args.subtotal) : null;
+  let subtotal, total;
+  if (items.length && sentSubtotal != null && sentTotal != null) {
+    // Full money contract (new client): verify it, then store the
+    // transmitted values. If it disagrees with its own items, the items
+    // win — never a silent re-parse of raw text when items were sent.
+    const consistent = Math.abs(itemsPosSum - sentSubtotal) <= 0.01
+      && Math.abs((sentSubtotal - discount + gst_amount) - sentTotal) <= 0.01;
+    if (consistent) { subtotal = sentSubtotal; total = sentTotal; }
+    else { subtotal = itemsPosSum; total = Math.max(0, subtotal - discount + gst_amount); }
+  } else if (items.length) {
+    // Items without the full contract: a positive transmitted total is
+    // never overridden (OP1 rule); otherwise derive from the lines
+    // themselves — never store a ₹0 bill for a bill that has items.
+    subtotal = sentSubtotal != null ? sentSubtotal : itemsPosSum;
+    total = (sentTotal != null && sentTotal > 0) ? sentTotal
+      : Math.max(0, (sentSubtotal != null ? sentSubtotal : itemsNetSum) - discount + gst_amount);
+  } else {
+    total = sentTotal != null ? sentTotal : 0;
+    if (!(total > 0) && typeof args.round_total === 'number' && num(args.round_total) > 0) total = num(args.round_total);
+    subtotal = sentSubtotal != null ? sentSubtotal : total;
   }
-  let total = Number(args.total || args.round_total || 0);
-  // OP1 ROOT FIX (2026-10-21): the Write-the-bill screen's round_total
-  // arrives as 0 in the real app flow (proven from stored rows B47/B49/B50:
-  // the parsed item lines WERE stored, with correct amounts, but total,
-  // subtotal and baki were all 0). When no usable total arrives but item
-  // lines exist, derive the total from the lines themselves — the data is
-  // already here; never store a ₹0 bill for a bill that has items.
-  // A positive total from either contract is never overridden.
-  if (total <= 0 && items.length) {
-    let derived = 0;
-    for (const it of items) {
-      const q = it.quantity != null ? Number(it.quantity) : (it.qty != null ? Number(it.qty) : 1);
-      const r = it.unit_price != null ? Number(it.unit_price) : Number(it.rate || 0);
-      const a = it.amount != null ? Number(it.amount) : (q || 0) * (r || 0);
-      if (Number.isFinite(a)) derived += a;
-    }
-    if (derived > 0) total = derived;
-  }
-  const joma = Number(args.joma != null ? args.joma : (args.paid != null ? args.paid : (args.paid_amount || 0)));
-  const subtotal = Number(args.subtotal || total);
-  const discount = Number(args.discount || 0);
-  const gst_amount = Number(args.gst_amount || args.gst || 0);
-  const baki = Number(args.baki != null ? args.baki : Math.max(0, total - joma));
+  const baki = Math.max(0, total - joma);
   const mode = args.mode === 'modern' ? 'modern' : 'future';
   const counter = args.counter ? String(args.counter) : null;
   if (total <= 0 && !items.length) { const e = new Error('bill total ya items required'); e.status = 400; throw e; }
