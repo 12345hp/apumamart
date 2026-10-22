@@ -132,6 +132,25 @@ function normMobile(m) {
   else if (d.length === 11 && d.startsWith('0')) d = d.slice(1);
   return d;
 }
+
+// International mobiles (2026-10-22, India+UAE build Phase 1).
+// India: 10-digit national, stored bare (the system's historic format).
+// UAE: 9-digit national starting with 5; stored FULL as '971' + national so
+// it can never collide with an Indian number in the UNIQUE mobile column.
+// Returns { country, national, full, stored } or null when unrecognised.
+function parseIntlMobile(m) {
+  let d = String(m || '').replace(/\D/g, '');
+  if (d.startsWith('00')) d = d.slice(2);
+  if (d.length === 12 && d.startsWith('971')) return { country: 'AE', national: d.slice(3), full: d, stored: d };
+  if (d.length === 9 && d.startsWith('5')) return { country: 'AE', national: d, full: '971' + d, stored: '971' + d };
+  if (d.length === 12 && d.startsWith('91')) return { country: 'IN', national: d.slice(2), full: d, stored: d.slice(2) };
+  if (d.length === 11 && d.startsWith('0')) return { country: 'IN', national: d.slice(1), full: '91' + d.slice(1), stored: d.slice(1) };
+  if (d.length === 10) return { country: 'IN', national: d, full: '91' + d, stored: d };
+  return null;
+}
+
+function mobForStorage(m) { const p = parseIntlMobile(m); return p ? p.stored : normMobile(m); }
+
 function pubUser(u) {
   if (!u) return u;
   const { password_hash, security_answer_hash, app_pin_hash, ...rest } = u; // eslint-disable-line no-unused-vars
@@ -264,7 +283,8 @@ app.post('/api/auth/signup', async (req, res) => {
     if (!needDb(res) || !needBcrypt(res)) return;
     const b = req.body || {};
     const name = b.name ? String(b.name).slice(0, 100) : null;
-    const mob = normMobile(b.mobile);
+    const mob = mobForStorage(b.mobile);
+    const signupCountry = (parseIntlMobile(b.mobile) || {}).country || (String(b.country || '').toUpperCase() === 'AE' ? 'AE' : 'IN');
     const password = b.password ? String(b.password) : '';
     const sq = String(b.security_question || b.securityQuestion || '').slice(0, 255);
     const sa = String(b.security_answer || b.securityAnswer || '');
@@ -283,8 +303,8 @@ app.post('/api/auth/signup', async (req, res) => {
     const password_hash = await bcrypt.hash(password, 12);
     const security_answer_hash = await bcrypt.hash(sa.toLowerCase().trim(), 12);
     const [r] = await pool.execute(
-      'INSERT INTO users (name, mobile, password_hash, security_question, security_answer_hash, role, business_name) VALUES (?,?,?,?,?,?,?)',
-      [name, mob, password_hash, sq, security_answer_hash, role, biz]
+      'INSERT INTO users (name, mobile, password_hash, security_question, security_answer_hash, role, business_name, country) VALUES (?,?,?,?,?,?,?,?)',
+      [name, mob, password_hash, sq, security_answer_hash, role, biz, signupCountry]
     );
     const [rows] = await pool.execute('SELECT * FROM users WHERE id = ?', [r.insertId]);
     const token = crypto.randomBytes(32).toString('hex');
@@ -304,7 +324,7 @@ app.post('/api/auth/signup', async (req, res) => {
 app.post('/api/auth/login', async (req, res) => {
   try {
     if (!needDb(res) || !needBcrypt(res)) return;
-    const mob = normMobile(req.body && req.body.mobile);
+    const mob = mobForStorage(req.body && req.body.mobile);
     const password = req.body && req.body.password ? String(req.body.password) : '';
     if (!mob || !password) return res.status(400).json({ ok: false, error: 'mobile and password required' });
     if (loginBlocked(mob)) {
@@ -369,7 +389,7 @@ app.get('/api/auth/me', async (req, res) => {
 app.post('/api/auth/forgot/start', async (req, res) => {
   try {
     if (!needDb(res)) return;
-    const mob = normMobile(req.body && req.body.mobile);
+    const mob = mobForStorage(req.body && req.body.mobile);
     if (!mob) return res.status(400).json({ ok: false, error: 'mobile is required' });
     const [rows] = await getPool().execute(
       'SELECT security_question FROM users WHERE mobile = ? OR mobile = ? OR mobile = ?',
@@ -390,7 +410,7 @@ app.post('/api/auth/forgot/reset', async (req, res) => {
   try {
     if (!needDb(res) || !needBcrypt(res)) return;
     const b = req.body || {};
-    const mob = normMobile(b.mobile);
+    const mob = mobForStorage(b.mobile);
     const answer = b.answer ? String(b.answer) : '';
     const newPassword = b.new_password || b.newPassword ? String(b.new_password || b.newPassword) : '';
     if (!mob || !answer) return res.status(400).json({ ok: false, error: 'mobile and answer required' });
