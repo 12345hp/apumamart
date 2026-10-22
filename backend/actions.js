@@ -982,10 +982,13 @@ async function hListBillsDirect(req, args) {
   try {
     const [rows] = await pool.execute(
       `SELECT b.id, b.bill_no, b.mode, b.items, b.subtotal, b.discount, b.gst_amount, b.total, b.joma, b.baki,
-              b.counter, b.customer_id, b.branch_id, b.created_at, c.name AS customer_name, c.mobile AS customer_mobile
+              b.counter, b.customer_id, b.branch_id, b.created_at, c.name AS customer_name, c.mobile AS customer_mobile,
+              e.status AS einvoice_status, e.missing_fields AS einvoice_missing
        FROM bills b LEFT JOIN customers c ON c.id = b.customer_id
+       LEFT JOIN bill_einvoices e ON e.bill_id = b.id
        WHERE ${where.join(' AND ')} ORDER BY b.id DESC LIMIT ${limit}`, params);
     const items = rows.map((r) => {
+      const { einvoice_status, einvoice_missing, ...rbase } = r;
       let rawItems = [];
       // mysql2 returns JSON columns already parsed (an array) — handle both
       // shapes; the old JSON.parse(array) threw and items silently became [].
@@ -998,12 +1001,17 @@ async function hListBillsDirect(req, args) {
         amount: it.amount != null ? it.amount : ((it.quantity || it.qty || 1) * (it.unit_price || it.rate || 0)),
         is_cut: !!it.is_cut, position: ix }));
       const total = Number(r.total), joma = Number(r.joma), baki = Number(r.baki);
-      return { ...r, items: billItems,
+      return { ...rbase, items: billItems,
         bill_number: r.bill_no, mobile: r.customer_mobile,
         subtotal: Number(r.subtotal), discount: Number(r.discount), gst_amount: Number(r.gst_amount),
         total, joma, baki, paid_so_far: joma, remaining: baki,
         payment_status: baki <= 0 ? 'paid' : (joma > 0 ? 'partial' : 'due'), payments: [], plus_amount: Math.max(0, joma - total) };
     });
+    if (user.country === 'AE') {
+      const rawById = {};
+      rows.forEach((r) => { rawById[r.id] = r; });
+      items.forEach((it) => { const rr = rawById[it.id]; it.einvoice_status = rr && rr.einvoice_status ? rr.einvoice_status : null; it.einvoice_ready = rr && rr.einvoice_status ? einvoiceReady(rr.einvoice_missing) : false; });
+    }
     return { ok: true, items, bills: items, total: items.length };
   } catch (_) { return { ok: true, items: [], bills: [], total: 0 }; }
 }
@@ -1347,6 +1355,13 @@ async function hSaveBillDirect(req, args) {
     const id = result.insertId;
     let bill_no = args.bill_no ? String(args.bill_no) : null;
     if (!bill_no) { bill_no = 'B' + id; await pool.execute('UPDATE bills SET bill_no = ? WHERE id = ?', [bill_no, id]); }
+    // E-invoice snapshot (UAE program item 3): AE accounts only, own
+    // try/catch — an e-invoice failure must never fail a bill save.
+    try {
+      if (user.country === 'AE') {
+        await storeEInvoice(pool, user, { id, bill_no, customer_id, subtotal, discount, gst_amount, total, created_at: new Date() }, items, 'save_time');
+      }
+    } catch (einvErr) { console.warn('[einvoice] snapshot skipped:', einvErr.message); }
     const billItems = items.map((it, ix) => ({
       id: ix + 1, bill_id: id,
       item_name: it.item_name || it.name || '', name: it.item_name || it.name || '',
@@ -3567,6 +3582,128 @@ async function hSyncBillPaymentLink(req, args) {
 // step runs. Signature = HMAC-SHA256 of the EXACT raw request body using
 // RAZORPAY_WEBHOOK_SECRET, sent in the X-Razorpay-Signature header. The raw
 // body is stashed by server.js (express.json verify hook) as req.rawBody —
+// ---------------------------------------------------------------------------
+// E-invoice readiness (UAE program item 3, 2026-10-22): for AE accounts,
+// every saved bill also stores a PINT-AE-shaped snapshot in bill_einvoices
+// (status 'not_sent'). The snapshot is frozen at save time so later profile
+// or customer edits can never rewrite an issued invoice; the only part that
+// may be completed afterwards is the buyer block of a 'not_sent' record
+// (via setCustomerTaxDetails), because the shopkeeper often learns the
+// buyer's TRN after the first bill. The document-level tax block is
+// authoritative (saveBill enforces subtotal - discount + gst = total);
+// per-line VAT is allocated proportionally and can differ by a paisa.
+// Sending through an accredited provider is a later step, NOT this item.
+// ---------------------------------------------------------------------------
+function einvoiceMissing(record) {
+  const missing = [];
+  const s = record.seller || {};
+  if (!s.name) missing.push('seller_name');
+  if (!s.address) missing.push('seller_address');
+  if (!s.trn || String(s.trn).replace(/\D/g, '').length !== 15) missing.push('seller_trn');
+  if (record.b2b) {
+    const b = record.buyer || {};
+    if (!b.name) missing.push('buyer_name');
+    if (!b.address) missing.push('buyer_address');
+    if (!b.trn) missing.push('buyer_trn');
+  }
+  return missing;
+}
+function einvoiceReady(mf) {
+  try { const a = typeof mf === 'string' ? JSON.parse(mf || '[]') : mf; return Array.isArray(a) && a.length === 0; } catch (_) { return false; }
+}
+function buildEInvoiceRecord(o) {
+  const rate = Number(o.rate || 0);
+  const subtotal = Number(o.subtotal || 0);
+  const discount = Number(o.discount || 0);
+  const r2 = (n) => Math.round(Number(n || 0) * 100) / 100;
+  const lines = (o.items || []).map((it) => {
+    const qty = it.quantity != null ? Number(it.quantity) : (it.qty != null ? Number(it.qty) : 1);
+    const unitPrice = it.unit_price != null ? Number(it.unit_price) : Number(it.rate || 0);
+    const lineNet = it.amount != null ? Number(it.amount) : qty * unitPrice;
+    const share = subtotal > 0 ? (lineNet / subtotal) * discount : 0;
+    return { name: it.item_name || it.name || '', qty, unit: it.unit || '', unit_price: unitPrice, line_net: r2(lineNet), vat_rate: rate, vat_amount: r2((lineNet - share) * rate / 100) };
+  });
+  const record = {
+    doc_type: '380', invoice_no: o.billNo, issue_at: o.issueAt, currency: 'AED', snapshot: o.snapshot || 'save_time',
+    seller: { name: (o.seller && o.seller.name) || '', address: (o.seller && o.seller.address) || '', phone: (o.seller && o.seller.phone) || '', email: (o.seller && o.seller.email) || '', trn: (o.seller && o.seller.trn) || '' },
+    buyer: o.buyer ? { name: o.buyer.name || '', mobile: o.buyer.mobile || '', address: o.buyer.address || '', trn: o.buyer.trn || '' } : null,
+    b2b: !!o.buyer,
+    lines,
+    tax: { rate, taxable_base: r2(subtotal - discount), vat_amount: r2(o.gstAmount) },
+    totals: { subtotal: r2(subtotal), discount: r2(discount), net: r2(subtotal - discount), vat: r2(o.gstAmount), grand_total: r2(o.total) },
+  };
+  return { record, missing_fields: einvoiceMissing(record) };
+}
+async function storeEInvoice(pool, user, billRow, items, snapshot) {
+  const [su] = await pool.execute('SELECT business_name, business_address, business_phone, email, gstin, gst_rate FROM users WHERE id = ?', [user.id]);
+  const s = su[0] || {};
+  let buyer = null;
+  if (billRow.customer_id) {
+    const [cu] = await pool.execute('SELECT name, mobile, trn, address FROM customers WHERE id = ? AND user_id = ?', [billRow.customer_id, user.id]);
+    if (cu.length) buyer = { name: cu[0].name, mobile: cu[0].mobile, trn: cu[0].trn, address: cu[0].address };
+  }
+  const built = buildEInvoiceRecord({
+    billNo: billRow.bill_no, issueAt: new Date(billRow.created_at || Date.now()).toISOString(), snapshot,
+    seller: { name: s.business_name, address: s.business_address, phone: s.business_phone, email: s.email, trn: s.gstin },
+    buyer, items: items || [], rate: s.gst_rate,
+    subtotal: billRow.subtotal, discount: billRow.discount, gstAmount: billRow.gst_amount, total: billRow.total,
+  });
+  await pool.execute(
+    `INSERT INTO bill_einvoices (user_id, bill_id, customer_id, status, record, missing_fields) VALUES (?,?,?, 'not_sent', ?, ?)
+     ON DUPLICATE KEY UPDATE record = VALUES(record), missing_fields = VALUES(missing_fields)`,
+    [user.id, billRow.id, billRow.customer_id || null, JSON.stringify(built.record), JSON.stringify(built.missing_fields)]
+  );
+  return built;
+}
+async function hSetCustomerTaxDetails(req, args) {
+  const { user } = needAuth(await authUser(req));
+  const customer_id = Number(args.customer_id);
+  if (!Number.isFinite(customer_id)) { const e = new Error('customer_id required'); e.status = 400; throw e; }
+  const trn = args.trn != null && String(args.trn).trim() !== '' ? String(args.trn).trim().toUpperCase().slice(0, 20) : null;
+  const address = args.address != null && String(args.address).trim() !== '' ? String(args.address).trim().slice(0, 500) : null;
+  const pool = getPool();
+  const [r] = await pool.execute('UPDATE customers SET trn = ?, address = ? WHERE id = ? AND user_id = ?', [trn, address, customer_id, user.id]);
+  if (!r.affectedRows) { const e = new Error('customer not found'); e.status = 404; throw e; }
+  // Complete the buyer block of this customer's not-yet-sent e-invoices.
+  let refreshed = 0;
+  try {
+    const [rows] = await pool.execute("SELECT id, record FROM bill_einvoices WHERE user_id = ? AND customer_id = ? AND status = 'not_sent'", [user.id, customer_id]);
+    const [cu] = await pool.execute('SELECT name, mobile FROM customers WHERE id = ? AND user_id = ?', [customer_id, user.id]);
+    for (const row of rows) {
+      const rec = typeof row.record === 'string' ? JSON.parse(row.record) : row.record;
+      if (!rec || !rec.buyer) continue;
+      rec.buyer.trn = trn || '';
+      rec.buyer.address = address || '';
+      if (cu.length) { rec.buyer.name = cu[0].name || rec.buyer.name; rec.buyer.mobile = cu[0].mobile || rec.buyer.mobile; }
+      const missing = einvoiceMissing(rec);
+      await pool.execute('UPDATE bill_einvoices SET record = ?, missing_fields = ? WHERE id = ?', [JSON.stringify(rec), JSON.stringify(missing), row.id]);
+      refreshed++;
+    }
+  } catch (_) {}
+  return { ok: true, saved: true, customer_id, trn, address, einvoices_refreshed: refreshed };
+}
+async function hGetEInvoice(req, args) {
+  const { user } = needAuth(await authUser(req));
+  const bill_id = Number(args.bill_id);
+  if (!Number.isFinite(bill_id)) { const e = new Error('bill_id required'); e.status = 400; throw e; }
+  const pool = getPool();
+  const [b] = await pool.execute('SELECT * FROM bills WHERE id = ? AND user_id = ?', [bill_id, user.id]);
+  if (!b.length) { const e = new Error('bill not found'); e.status = 404; throw e; }
+  const bill = b[0];
+  const [rows] = await pool.execute('SELECT status, record, missing_fields FROM bill_einvoices WHERE bill_id = ? AND user_id = ?', [bill_id, user.id]);
+  if (rows.length) {
+    const missing = typeof rows[0].missing_fields === 'string' ? JSON.parse(rows[0].missing_fields || '[]') : (rows[0].missing_fields || []);
+    const record = typeof rows[0].record === 'string' ? JSON.parse(rows[0].record || 'null') : rows[0].record;
+    return { ok: true, status: rows[0].status, ready: missing.length === 0, missing_fields: missing, record };
+  }
+  if (user.country !== 'AE') return { ok: true, status: null, ready: false, missing_fields: [], record: null };
+  // Pre-existing AE bill: build a late snapshot from current data.
+  let items = [];
+  try { items = Array.isArray(bill.items) ? bill.items : JSON.parse(bill.items || '[]'); } catch (_) { items = []; }
+  const built = await storeEInvoice(pool, user, bill, items, 'late');
+  return { ok: true, status: 'not_sent', ready: built.missing_fields.length === 0, missing_fields: built.missing_fields, record: built.record };
+}
+
 // parsed JSON is never re-serialized for the signature check.
 // The two 400 strings are distinct on purpose: 'webhook not configured'
 // means the secret env var is missing; 'invalid webhook signature' means
@@ -4340,6 +4477,8 @@ const DIRECT = {
   getBillPaymentLinks: hGetBillPaymentLinks,
   cancelBillPaymentLink: hCancelBillPaymentLink,
   syncBillPaymentLink: hSyncBillPaymentLink,
+  setCustomerTaxDetails: hSetCustomerTaxDetails,
+  getEInvoice: hGetEInvoice,
   getMyReferral: hGetMyReferral,
   applyReferralCode: hApplyReferralCode,
   exportMyData: hExportMyData,
