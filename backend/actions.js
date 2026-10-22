@@ -13,7 +13,7 @@ const http = require('http');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const { getPool, isReady } = require('./db');
-const { normMobile, pubUser, num } = require('./util');
+const { normMobile, pubUser, num, parseIntlMobile, countryMeta } = require('./util');
 
 const router = express.Router();
 
@@ -253,8 +253,12 @@ function msg91Get(path) {
 }
 
 async function hRequestOwnerOtp(req, args) {
-  const mobile = String(args.mobile || '').replace(/\D/g, '').slice(-10);
-  if (mobile.length !== 10) { const e = new Error('10 digit mobile required'); e.status = 400; throw e; }
+  const intl = parseIntlMobile(args.mobile);
+  if (!intl) { const e = new Error('valid mobile number required'); e.status = 400; throw e; }
+  // OTP SMS rides the India DLT route only (Phase 1): UAE numbers use the
+  // password door. Refuse BEFORE any SMS machinery is touched.
+  if (intl.country !== 'IN') { const e = new Error('OTP login abhi sirf India numbers ke liye hai - password se login karo'); e.status = 400; throw e; }
+  const mobile = intl.national;
   const pool = getPool();
   // Only allow OTP for owner/admin users
   const [u] = await pool.execute("SELECT id, role FROM users WHERE mobile = ? AND role IN ('owner','admin')", [mobile]);
@@ -293,9 +297,11 @@ async function hRequestOwnerOtp(req, args) {
 }
 
 async function hVerifyOwnerOtp(req, args) {
-  const mobile = String(args.mobile || '').replace(/\D/g, '').slice(-10);
+  const intl = parseIntlMobile(args.mobile);
   const otp = String(args.otp || '').trim();
-  if (mobile.length !== 10 || !otp) { const e = new Error('mobile aur otp required'); e.status = 400; throw e; }
+  if (!intl || !otp) { const e = new Error('mobile aur otp required'); e.status = 400; throw e; }
+  if (intl.country !== 'IN') { const e = new Error('OTP login abhi sirf India numbers ke liye hai - password se login karo'); e.status = 400; throw e; }
+  const mobile = intl.national;
   const pool = getPool();
   // Verify against our local DB (we generate OTP ourselves)
   let verified = false;
@@ -2332,6 +2338,7 @@ async function hCreateBranch(req, args) {
       [String(args.manager_name || '').trim() || (name + ' Manager'), loginMobile, name]
     );
     branchUserId = ur.insertId;
+    try { if (user.country) await pool.execute('UPDATE users SET country = ? WHERE id = ?', [user.country, branchUserId]); } catch (_) {}
   } catch (e) { console.error('[createBranch] branch user failed:', e.message); }
   const [r] = await pool.execute(
     `INSERT INTO branches (owner_user_id, name, address, phone, manager_name, manager_mobile, access_token, token_active, branch_user_id)
@@ -2478,6 +2485,7 @@ async function hGetBranchByToken(req, args) {
         [b.manager_name || (b.name + ' Manager'), loginMobile, b.name]
       );
       branchUserId = ur.insertId;
+      try { const [oc] = await pool.execute('SELECT country FROM users WHERE id = ?', [b.owner_user_id]); if (oc[0] && oc[0].country) await pool.execute('UPDATE users SET country = ? WHERE id = ?', [oc[0].country, branchUserId]); } catch (_) {}
       await pool.execute('UPDATE branches SET branch_user_id = ? WHERE id = ?', [branchUserId, b.id]);
     } catch (e) { console.error('[branchToken] branch user create failed:', e.message); }
   }
@@ -2783,10 +2791,20 @@ async function hGetBusinessProfile(req) {
     `SELECT business_name, business_address, business_phone, upi_id, loyalty_rate,
             store_code, online_store_enabled, shop_hours, return_policy,
             gst_rate, gstin, pan_number, discount_percent,
-            business_category, business_subcategory, photo_url
+            business_category, business_subcategory, photo_url, country
      FROM users WHERE id = ?`, [user.id]
   );
   const u = rows[0] || {};
+  // Country foundation (2026-10-22 Phase 1): the account country drives
+  // currency + tax label + plans. It LOCKS once the account has any bill
+  // or any subscription record; after that only support (admin) moves it.
+  const meta = countryMeta(u.country);
+  let countryLocked = false;
+  try {
+    const [lk] = await getPool().execute(
+      `SELECT (EXISTS(SELECT 1 FROM bills WHERE user_id = ?) OR EXISTS(SELECT 1 FROM user_subscriptions WHERE user_id = ?)) AS locked`, [user.id, user.id]);
+    countryLocked = !!(lk[0] && Number(lk[0].locked) === 1);
+  } catch (_) { /* lock state is advisory here; save path re-checks */ }
   const profile = {
     name: u.business_name, address: u.business_address, phone: u.business_phone,
     upi_id: u.upi_id, loyalty_rate: u.loyalty_rate == null ? null : Number(u.loyalty_rate),
@@ -2797,6 +2815,8 @@ async function hGetBusinessProfile(req) {
     discount_percent: u.discount_percent == null ? null : Number(u.discount_percent),
     business_category: u.business_category, business_subcategory: u.business_subcategory,
     photo_url: u.photo_url,
+    country: meta.country, currency: meta.currency, tax_label: meta.tax_label,
+    country_locked: countryLocked,
   };
   // Frontend accesses data.phone, data.profile, data.rates directly —
   // return all at top level to avoid "cannot read properties of undefined"
@@ -2805,6 +2825,10 @@ async function hGetBusinessProfile(req) {
     profile: profile,
     phone: profile.phone || null,
     name: profile.name || null,
+    country: meta.country,
+    currency: meta.currency,
+    tax_label: meta.tax_label,
+    country_locked: countryLocked,
     rates: [],
     rate_cards: [],
   };
@@ -2815,6 +2839,27 @@ async function hSaveBusinessProfile(req, args) {
   const name = args.name ? String(args.name).slice(0, 150) : null;
   if (!name) { const e = new Error('business name is required'); e.status = 400; throw e; }
   const pool = getPool();
+  // Country change (2026-10-22 Phase 1): free until the account has any
+  // bill or subscription (country_locked); after that only the admin role
+  // may move an account between countries (support action).
+  if (args.country !== undefined && args.country !== null && String(args.country).trim() !== '') {
+    const want = String(args.country).toUpperCase() === 'AE' ? 'AE' : 'IN';
+    const [cur] = await pool.execute('SELECT country FROM users WHERE id = ?', [user.id]);
+    const have = cur[0] && cur[0].country === 'AE' ? 'AE' : 'IN';
+    if (want !== have) {
+      let locked = false;
+      try {
+        const [lk] = await pool.execute(
+          `SELECT (EXISTS(SELECT 1 FROM bills WHERE user_id = ?) OR EXISTS(SELECT 1 FROM user_subscriptions WHERE user_id = ?)) AS locked`, [user.id, user.id]);
+        locked = !!(lk[0] && Number(lk[0].locked) === 1);
+      } catch (_) {}
+      if (locked && user.role !== 'admin') {
+        const e = new Error('Country lock ho gaya hai - pehla bill ya plan banne ke baad country sirf support se badalta hai');
+        e.status = 400; throw e;
+      }
+      await pool.execute('UPDATE users SET country = ? WHERE id = ?', [want, user.id]);
+    }
+  }
   await pool.execute(
     `UPDATE users SET business_name = ?, business_address = ?, business_phone = ?,
       upi_id = ?, loyalty_rate = ?, store_code = ?, online_store_enabled = ?,
