@@ -3367,6 +3367,200 @@ async function hVerifyWebSubscription(req, args) {
 }
 
 // ---------------------------------------------------------------------------
+// Bill payment links (UAE program item 2, 2026-10-22): the shopkeeper sends
+// a customer a Razorpay payment link for his khata baki; the customer pays
+// by card on Razorpay's own page; the money lands in the khata as a
+// STANDALONE payment (note 'Payment link') — the hRecordCustomerPayment
+// shape, NEVER the 'Bill payment' shape, so the shared rollup
+// (customerBakiRows, which excludes exactly-'Bill payment' rows because
+// recordPayment also writes bills.joma) counts it exactly once, and no
+// bill's joma/baki is ever touched. Settlement runs through ONE helper
+// (applyBillLinkSettlement) shared by the Razorpay webhook
+// (payment_link.paid) and the sync action — the same two-doors shape as
+// subscriptions (verify <-> webhook, one activation helper).
+// ---------------------------------------------------------------------------
+
+// Settle one paid link into the khata. Amount truth = OUR stored row,
+// cross-checked against what Razorpay confirms was paid BEFORE anything
+// is written; a mismatch is logged loudly and nothing is written. The
+// guarded flip (WHERE status <> 'paid') is the idempotency lock: webhook
+// retries, webhook+sync racing and double taps all lose safely, so a
+// link can never produce two payments rows.
+async function applyBillLinkSettlement(pool, linkRow, paymentId, paidMinor) {
+  if (paidMinor != null && Number.isFinite(Number(paidMinor)) && Number(paidMinor) !== Number(linkRow.amount)) {
+    console.error('bill payment link: amount mismatch for', linkRow.razorpay_link_id, 'stored', linkRow.amount, 'paid', paidMinor);
+    return false;
+  }
+  const [u] = await pool.execute(
+    `UPDATE bill_payment_links SET status = 'paid', razorpay_payment_id = ?, paid_at = NOW()
+     WHERE id = ? AND status <> 'paid'`,
+    [paymentId || null, linkRow.id]
+  );
+  if (!u.affectedRows) return false; // already settled through the other door
+  const [ins] = await pool.execute(
+    'INSERT INTO payments (user_id, customer_id, amount, note) VALUES (?, ?, ?, ?)',
+    [linkRow.user_id, linkRow.customer_id, Number(linkRow.amount) / 100, 'Payment link']
+  );
+  await pool.execute('UPDATE bill_payment_links SET payment_row_id = ? WHERE id = ?', [ins.insertId, linkRow.id]);
+  return true;
+}
+
+async function hCreateBillPaymentLink(req, args) {
+  const { user } = needAuth(await authUser(req));
+  const customer_id = Number(args.customer_id);
+  if (!Number.isFinite(customer_id)) { const e = new Error('customer_id required'); e.status = 400; throw e; }
+  const pool = getPool();
+  const [c] = await pool.execute('SELECT id, name, mobile FROM customers WHERE id = ? AND user_id = ?', [customer_id, user.id]);
+  if (!c.length) { const e = new Error('customer not found'); e.status = 404; throw e; }
+  const cust = c[0];
+  // Amount: explicit (a part payment is a real use) or the full baki.
+  // Never more than the baki — a link above the baki has no meaning.
+  const rows = await customerBakiRows(user.id);
+  const me = rows.find((r) => Number(r.customer_id) === customer_id);
+  const totalBaki = me ? Number(me.total_baki) : 0;
+  let amount = (args.amount != null && args.amount !== '') ? Number(args.amount) : totalBaki;
+  if (!Number.isFinite(amount) || amount <= 0) { const e = new Error('valid amount required'); e.status = 400; throw e; }
+  amount = Math.round(amount * 100) / 100;
+  if (amount > totalBaki + 0.005) { const e = new Error('amount baki se zyada hai'); e.status = 400; throw e; }
+  // Currency from the account, never from the client (the Phase-3 rule).
+  const currency = (user.country === 'AE') ? 'AED' : 'INR';
+  const amountMinor = Math.round(amount * 100);
+  // Reuse rule: an open link for the same customer + same amount is
+  // returned as-is instead of creating a twin; a different amount
+  // supersedes the older open links (below, after the new one exists).
+  const [open] = await pool.execute(
+    `SELECT * FROM bill_payment_links WHERE user_id = ? AND customer_id = ? AND status = 'created' ORDER BY id DESC`,
+    [user.id, customer_id]
+  );
+  const same = open.find((l) => Number(l.amount) === amountMinor);
+  if (same) {
+    return { ok: true, link_id: same.razorpay_link_id, short_url: same.short_url, amount: Number(same.amount) / 100, currency: same.currency, status: same.status, reused: true };
+  }
+  const { keyId, keySecret } = razorpayKeys();
+  const reference_id = `ampl_${user.id}_${Date.now()}`;
+  const digits = String(cust.mobile || '').replace(/\D/g, '');
+  const contact = !digits ? '' : (currency === 'AED' ? '+971' + digits.slice(-9) : '+91' + digits.slice(-10));
+  const [shop] = await pool.execute('SELECT business_name FROM users WHERE id = ?', [user.id]);
+  const shopName = (shop.length && shop[0].business_name) ? String(shop[0].business_name).slice(0, 80) : 'ApumaMart';
+  // Customer object — Razorpay's rule, proven by the 2026-10-22 probe:
+  // an INR link may be generic (no customer object; the payer fills his
+  // details on Razorpay's page), but an AED (international) link demands
+  // FULL customer details including an email ("customer details are
+  // required"). Our customers table holds no email, so the panel asks
+  // the shopkeeper for the customer's email and passes it as
+  // customer_email; the object is included only when an email exists —
+  // an email is never invented.
+  const custEmail = args.customer_email ? String(args.customer_email).trim().slice(0, 120) : '';
+  const linkPayload = {
+    amount: amountMinor,
+    currency,
+    reference_id,
+    description: shopName + ' - khata payment',
+    notes: { user_id: String(user.id), customer_id: String(customer_id), reference_id },
+    expire_by: Math.floor(Date.now() / 1000) + 7 * 24 * 3600,
+    reminder_enable: true,
+  };
+  if (custEmail) {
+    linkPayload.customer = { name: String(cust.name || 'Customer').slice(0, 100), contact, email: custEmail };
+    linkPayload.notify = { sms: true, email: true };
+  }
+  let r;
+  try {
+    r = await razorpayRequest(keyId, keySecret, 'POST', '/v1/payment_links', linkPayload);
+  } catch (reqErr) {
+    const e = new Error('could not reach the payment service, try again');
+    e.status = 502; throw e;
+  }
+  if (r.status < 200 || r.status >= 300 || !r.body || !r.body.id) {
+    // Razorpay's own description is the answer (activation gates live
+    // there); no row is stored for a link that does not exist.
+    const msg = (r.body && r.body.error && r.body.error.description) || 'could not create payment link';
+    const e = new Error(msg);
+    e.status = 502; throw e;
+  }
+  const bill_id = (args.bill_id && Number.isFinite(Number(args.bill_id))) ? Number(args.bill_id) : null;
+  await pool.execute(
+    `INSERT INTO bill_payment_links (user_id, customer_id, bill_id, razorpay_link_id, reference_id, short_url, amount, currency, status)
+     VALUES (?,?,?,?,?,?,?,?,'created')`,
+    [user.id, customer_id, bill_id, r.body.id, reference_id, r.body.short_url || null, amountMinor, currency]
+  );
+  // Supersede the older open links (best effort at Razorpay too). A
+  // superseded link that still gets paid later still settles truthfully
+  // through the webhook — the money is real, the khata plus shows it.
+  for (const old of open) {
+    await pool.execute(`UPDATE bill_payment_links SET status = 'superseded' WHERE id = ? AND status = 'created'`, [old.id]);
+    try { await razorpayRequest(keyId, keySecret, 'POST', `/v1/payment_links/${old.razorpay_link_id}/cancel`, {}); } catch (_) {}
+  }
+  return { ok: true, link_id: r.body.id, short_url: r.body.short_url || null, amount, currency, status: 'created' };
+}
+
+async function hGetBillPaymentLinks(req, args) {
+  const { user } = needAuth(await authUser(req));
+  const customer_id = Number(args.customer_id);
+  if (!Number.isFinite(customer_id)) { const e = new Error('customer_id required'); e.status = 400; throw e; }
+  const pool = getPool();
+  const [c] = await pool.execute('SELECT id FROM customers WHERE id = ? AND user_id = ?', [customer_id, user.id]);
+  if (!c.length) { const e = new Error('customer not found'); e.status = 404; throw e; }
+  const [rows] = await pool.execute(
+    `SELECT id, razorpay_link_id, short_url, amount, currency, status, razorpay_payment_id, created_at, paid_at
+     FROM bill_payment_links WHERE user_id = ? AND customer_id = ? ORDER BY id DESC LIMIT 20`,
+    [user.id, customer_id]
+  );
+  return { ok: true, links: rows.map((l) => ({ ...l, amount: Number(l.amount) / 100 })) };
+}
+
+async function hCancelBillPaymentLink(req, args) {
+  const { user } = needAuth(await authUser(req));
+  const link_id = String(args.link_id || '');
+  if (!link_id) { const e = new Error('link_id required'); e.status = 400; throw e; }
+  const pool = getPool();
+  const [rows] = await pool.execute('SELECT * FROM bill_payment_links WHERE razorpay_link_id = ? AND user_id = ?', [link_id, user.id]);
+  if (!rows.length) { const e = new Error('link not found'); e.status = 404; throw e; }
+  if (rows[0].status !== 'created') return { ok: true, status: rows[0].status };
+  const { keyId, keySecret } = razorpayKeys();
+  const r = await razorpayRequest(keyId, keySecret, 'POST', `/v1/payment_links/${link_id}/cancel`, {});
+  if (r.status < 200 || r.status >= 300) {
+    const msg = (r.body && r.body.error && r.body.error.description) || 'could not cancel payment link';
+    const e = new Error(msg); e.status = 502; throw e;
+  }
+  await pool.execute(`UPDATE bill_payment_links SET status = 'cancelled' WHERE id = ? AND status = 'created'`, [rows[0].id]);
+  return { ok: true, status: 'cancelled' };
+}
+
+// The belt-and-braces twin of the webhook: the panel calls this when it
+// opens, so a paid link lands in the khata even if the webhook event is
+// delayed, missing, or not yet enabled in the Razorpay dashboard.
+async function hSyncBillPaymentLink(req, args) {
+  const { user } = needAuth(await authUser(req));
+  const link_id = String(args.link_id || '');
+  if (!link_id) { const e = new Error('link_id required'); e.status = 400; throw e; }
+  const pool = getPool();
+  const [rows] = await pool.execute('SELECT * FROM bill_payment_links WHERE razorpay_link_id = ? AND user_id = ?', [link_id, user.id]);
+  if (!rows.length) { const e = new Error('link not found'); e.status = 404; throw e; }
+  const row = rows[0];
+  if (row.status === 'paid') return { ok: true, status: 'paid', settled: false };
+  const { keyId, keySecret } = razorpayKeys();
+  const r = await razorpayRequest(keyId, keySecret, 'GET', `/v1/payment_links/${link_id}`);
+  if (r.status < 200 || r.status >= 300 || !r.body) {
+    const msg = (r.body && r.body.error && r.body.error.description) || 'could not read payment link';
+    const e = new Error(msg); e.status = 502; throw e;
+  }
+  const st = String(r.body.status || '');
+  if (st === 'paid') {
+    const paidMinor = (r.body.amount_paid != null) ? Number(r.body.amount_paid) : Number(row.amount);
+    // Razorpay's link read may not name the payment id; the webhook
+    // fills razorpay_payment_id in when it arrives. Settle now anyway.
+    const settled = await applyBillLinkSettlement(pool, row, row.razorpay_payment_id || null, paidMinor);
+    return { ok: true, status: 'paid', settled };
+  }
+  if ((st === 'cancelled' || st === 'expired') && row.status === 'created') {
+    await pool.execute('UPDATE bill_payment_links SET status = ? WHERE id = ?', [st, row.id]);
+    return { ok: true, status: st, settled: false };
+  }
+  return { ok: true, status: row.status, settled: false };
+}
+
+// ---------------------------------------------------------------------------
 // Razorpay webhook: POST /api/actions/razorpay-webhook (server-to-server).
 // Razorpay calls this when a payment is captured or fails, so a paid plan
 // activates even if the customer closes the app before the browser verify
@@ -3420,6 +3614,40 @@ async function hRazorpayWebhook(req, res) {
         }
         // Already 'paid' (browser verify ran first, or a repeat delivery):
         // acknowledge and change nothing — no double extension.
+      }
+    }
+    if (evt.event === 'payment_link.paid') {
+      // Bill payment links (item 2): settle into the khata via the shared
+      // helper. A link payment ALSO produces a payment.captured whose
+      // order_id is Razorpay-internal — it lands in the "unknown order"
+      // log line above and changes nothing; settlement happens here.
+      const linkEntity = (evt.payload && evt.payload.payment_link && evt.payload.payment_link.entity) || {};
+      const payEntity = (evt.payload && evt.payload.payment && evt.payload.payment.entity) || {};
+      const linkId = String(linkEntity.id || '');
+      const paymentId = String(payEntity.id || '');
+      const paidMinor = (linkEntity.amount_paid != null) ? Number(linkEntity.amount_paid) : null;
+      if (linkId) {
+        const pool = getPool();
+        const [rows] = await pool.execute('SELECT * FROM bill_payment_links WHERE razorpay_link_id = ?', [linkId]);
+        if (!rows.length) {
+          console.error('razorpay webhook: payment_link.paid for unknown link', linkId);
+        } else if (rows[0].status !== 'paid') {
+          await applyBillLinkSettlement(pool, rows[0], paymentId || null, paidMinor);
+        } else if (paymentId && !rows[0].razorpay_payment_id) {
+          // Sync settled first without a payment id — fill it in, nothing else.
+          await pool.execute('UPDATE bill_payment_links SET razorpay_payment_id = ? WHERE id = ?', [paymentId, rows[0].id]);
+        }
+      }
+    }
+    if (evt.event === 'payment_link.cancelled' || evt.event === 'payment_link.expired') {
+      const linkEntity = (evt.payload && evt.payload.payment_link && evt.payload.payment_link.entity) || {};
+      const linkId = String(linkEntity.id || '');
+      if (linkId) {
+        const pool = getPool();
+        await pool.execute(
+          `UPDATE bill_payment_links SET status = ? WHERE razorpay_link_id = ? AND status = 'created'`,
+          [evt.event === 'payment_link.cancelled' ? 'cancelled' : 'expired', linkId]
+        );
       }
     }
     // payment.failed and every other valid event: acknowledge, change nothing.
@@ -4108,6 +4336,10 @@ const DIRECT = {
   getMySubscription: hGetMySubscription,
   createWebSubscriptionOrder: hCreateWebSubscriptionOrder,
   verifyWebSubscription: hVerifyWebSubscription,
+  createBillPaymentLink: hCreateBillPaymentLink,
+  getBillPaymentLinks: hGetBillPaymentLinks,
+  cancelBillPaymentLink: hCancelBillPaymentLink,
+  syncBillPaymentLink: hSyncBillPaymentLink,
   getMyReferral: hGetMyReferral,
   applyReferralCode: hApplyReferralCode,
   exportMyData: hExportMyData,
