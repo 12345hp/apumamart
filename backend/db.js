@@ -542,6 +542,10 @@ async function ensureBillColumns(pool) {
     counter_id: 'INT NULL',
     payment_mode: 'VARCHAR(20) NULL',
     coupon_code: 'VARCHAR(40) NULL',
+    // Offline mode (UAE program item 4, 2026-10-22): client-generated
+    // idempotency key. A queued write carries the same key on every retry,
+    // so the server can accept it exactly once (unique index below).
+    client_sync_id: 'VARCHAR(64) NULL',
   };
   for (const [col, def] of Object.entries(defs)) {
     const [rows] = await pool.execute(
@@ -641,6 +645,18 @@ async function initDb() {
       if (!cols.length) await pool.execute("ALTER TABLE branches ADD COLUMN branch_user_id INT NULL");
     } catch (_) {}
     await ensureBillColumns(pool);
+    // Migration: offline sync idempotency (UAE program item 4, 2026-10-22).
+    // payments.client_sync_id + a UNIQUE (user_id, client_sync_id) index on
+    // bills and payments. NULL keys never collide in MySQL unique indexes,
+    // so all pre-offline rows stay untouched.
+    try {
+      const [pc] = await pool.execute("SELECT COUNT(*) AS c FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'payments' AND COLUMN_NAME = 'client_sync_id'");
+      if (pc[0].c === 0) await pool.execute('ALTER TABLE payments ADD COLUMN client_sync_id VARCHAR(64) NULL');
+      for (const [tbl, idx] of [['bills', 'uq_bills_sync'], ['payments', 'uq_payments_sync']]) {
+        const [ic] = await pool.execute("SELECT COUNT(*) AS c FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ?", [tbl, idx]);
+        if (ic[0].c === 0) await pool.execute(`ALTER TABLE ${tbl} ADD UNIQUE INDEX ${idx} (user_id, client_sync_id)`);
+      }
+    } catch (e) { console.warn('[db] offline sync migration skipped:', e.message); }
     // Migration: customers.credit_limit (credit-limit block, UAE program item 1, 2026-10-22)
     try {
       const [cc] = await pool.execute("SELECT COUNT(*) AS c FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'customers' AND COLUMN_NAME = 'credit_limit'");
