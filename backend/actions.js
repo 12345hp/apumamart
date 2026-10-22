@@ -551,7 +551,7 @@ async function hListCustomerLedger(req, args) {
 // Customer baki rollup shared by getKhata / getBakiOverview.
 async function customerBakiRows(userId) {
   const [rows] = await getPool().execute(
-    `SELECT c.id AS customer_id, c.name AS customer_name, c.mobile,
+    `SELECT c.id AS customer_id, c.name AS customer_name, c.mobile, c.credit_limit,
             c.created_at AS joined_on,
             COALESCE((SELECT SUM(b.total) FROM bills b WHERE b.customer_id = c.id AND b.user_id = c.user_id), 0) AS total_billed,
             COALESCE((SELECT SUM(b.joma) FROM bills b WHERE b.customer_id = c.id AND b.user_id = c.user_id), 0) AS bills_joma,
@@ -593,9 +593,26 @@ async function customerBakiRows(userId) {
       paid_so_far: paidSoFar, paid: paidSoFar,
       total_baki: due, amount_due: due, total_due: due, baki: due,
       plus_amount: plus, plus: plus,
+      credit_limit: r.credit_limit != null ? Number(r.credit_limit) : null,
+      aging_bucket: due > 0 ? (daysOverdue <= 30 ? '0-30' : daysOverdue <= 60 ? '31-60' : daysOverdue <= 90 ? '61-90' : '90+') : null,
       days_overdue: daysOverdue,
     };
   });
+}
+
+// Aging summary (UAE program item 1, 2026-10-22): each customer's whole
+// baki sits in ONE bucket, chosen by the age of his oldest unpaid bill
+// (the rollup's aging_bucket). Amounts therefore always sum to total_baki.
+function agingSummary(rows) {
+  const out = {};
+  for (const b of ['0-30', '31-60', '61-90', '90+']) out[b] = { bucket: b, customers: 0, amount: 0 };
+  for (const r of rows) {
+    if (r.aging_bucket && Number(r.total_baki) > 0) {
+      out[r.aging_bucket].customers += 1;
+      out[r.aging_bucket].amount += Number(r.total_baki);
+    }
+  }
+  return Object.values(out).map((b) => ({ bucket: b.bucket, customers: b.customers, amount: Math.round(b.amount * 100) / 100 }));
 }
 
 async function hGetKhata(req) {
@@ -604,7 +621,7 @@ async function hGetKhata(req) {
   customers.sort((a, b) => b.total_baki - a.total_baki);
   const total_due = customers.reduce((s, c) => s + Math.max(0, c.total_baki), 0);
   const total_plus = customers.reduce((s, c) => s + (c.plus_amount || 0), 0);
-  return { ok: true, customers, total_due, total_plus };
+  return { ok: true, customers, total_due, total_plus, aging_summary: agingSummary(customers) };
 }
 
 async function hGetBakiOverview(req, args) {
@@ -626,6 +643,7 @@ async function hGetBakiOverview(req, args) {
     total_due: total_baki,
     total_plus,
     total_customers: all.length,
+    aging_summary: agingSummary(all),
     page,
     page_size: pageSize,
     total: all.length,
@@ -1286,6 +1304,28 @@ async function hSaveBillDirect(req, args) {
     subtotal = sentSubtotal != null ? sentSubtotal : total;
   }
   const baki = Math.max(0, total - joma);
+  // Credit-limit block (UAE program item 1, 2026-10-22): if the owner set a
+  // credit_limit for this customer and this bill's baki would push his total
+  // due past it, refuse the save — unless the owner confirmed the override
+  // (credit_override). No limit set (NULL) = never blocked; a fully-paid bill
+  // (baki 0) never blocks; a plus (overpaid) balance eats the new baki first
+  // because the maths runs on the signed balance.
+  if (customer_id && baki > 0 && !args.credit_override) {
+    const [cl] = await pool.execute('SELECT credit_limit FROM customers WHERE id = ? AND user_id = ?', [customer_id, user.id]);
+    const limit = cl.length && cl[0].credit_limit != null ? Number(cl[0].credit_limit) : null;
+    if (limit != null && Number.isFinite(limit)) {
+      const rows = await customerBakiRows(user.id);
+      const me = rows.find((r) => Number(r.customer_id) === Number(customer_id));
+      const balance = me ? (Number(me.total_billed) - Number(me.paid_so_far)) : 0;
+      const projected = Math.max(0, balance + baki);
+      if (projected > limit + 0.005) {
+        const e = new Error('CREDIT_LIMIT: customer credit limit crossed (limit ' + limit + ', after this bill due would be ' + projected.toFixed(2) + ')');
+        e.status = 400; e.code = 'CREDIT_LIMIT';
+        e.credit = { credit_limit: limit, current_due: me ? Number(me.total_baki) : 0, bill_baki: baki, projected_due: projected };
+        throw e;
+      }
+    }
+  }
   const mode = args.mode === 'modern' ? 'modern' : 'future';
   const counter = args.counter ? String(args.counter) : null;
   if (total <= 0 && !items.length) { const e = new Error('bill total ya items required'); e.status = 400; throw e; }
@@ -1373,6 +1413,46 @@ async function hRecordCustomerPaymentDirect(req, args) {
     const err = new Error('payment save failed: ' + (e.message || 'db error'));
     err.status = 500; throw err;
   }
+}
+// Credit limit (UAE program item 1, 2026-10-22): set/remove a customer's
+// credit limit. credit_limit null/'' removes the limit (never blocked);
+// 0 is a real limit (no credit at all). Ownership via user.id, as everywhere.
+async function hSetCustomerCreditLimit(req, args) {
+  const { user } = needAuth(await authUser(req));
+  const customer_id = Number(args.customer_id);
+  if (!Number.isFinite(customer_id)) { const e = new Error('customer_id required'); e.status = 400; throw e; }
+  let limit = null;
+  if (args.credit_limit != null && args.credit_limit !== '') {
+    limit = Number(args.credit_limit);
+    if (!Number.isFinite(limit) || limit < 0) { const e = new Error('valid credit_limit required'); e.status = 400; throw e; }
+    limit = Math.round(limit * 100) / 100;
+  }
+  const pool = getPool();
+  const [r] = await pool.execute('UPDATE customers SET credit_limit = ? WHERE id = ? AND user_id = ?', [limit, customer_id, user.id]);
+  if (!r.affectedRows) { const e = new Error('customer not found'); e.status = 404; throw e; }
+  return { ok: true, saved: true, customer_id, credit_limit: limit };
+}
+
+// Read-side twin of the saveBill block: the billing screens ask BEFORE
+// saving so the owner sees the numbers and can allow once. The server
+// stays the enforcer — this check never grants anything by itself.
+async function hCheckCreditLimit(req, args) {
+  const { user } = needAuth(await authUser(req));
+  const customer_id = Number(args.customer_id);
+  const add = Math.max(0, Number(args.add_baki) || 0);
+  if (!Number.isFinite(customer_id)) return { ok: false, error: 'customer_id required', blocked: false };
+  const pool = getPool();
+  const [c] = await pool.execute('SELECT credit_limit FROM customers WHERE id = ? AND user_id = ?', [customer_id, user.id]);
+  if (!c.length) return { ok: false, error: 'customer not found', blocked: false };
+  const limit = c[0].credit_limit != null ? Number(c[0].credit_limit) : null;
+  const rows = await customerBakiRows(user.id);
+  const me = rows.find((r) => Number(r.customer_id) === customer_id);
+  const balance = me ? (Number(me.total_billed) - Number(me.paid_so_far)) : 0;
+  const projected = Math.max(0, balance + add);
+  const blocked = limit != null && projected > limit + 0.005;
+  return { ok: true, customer_id, has_limit: limit != null, credit_limit: limit,
+    current_due: me ? Number(me.total_baki) : 0, plus_amount: me ? Number(me.plus_amount || 0) : 0,
+    projected_due: projected, blocked };
 }
 async function hUpdateCustomerDirect(req, args) {
   const { user } = needAuth(await authUser(req));
@@ -3925,6 +4005,8 @@ const DIRECT = {
   deleteBill: hDeleteBillDirect,
   recordPayment: hRecordPaymentDirect,
   recordCustomerPayment: hRecordCustomerPaymentDirect,
+  setCustomerCreditLimit: hSetCustomerCreditLimit,
+  checkCreditLimit: hCheckCreditLimit,
   updateCustomer: hUpdateCustomerDirect,
   mergeCustomers: hMergeCustomersDirect,
   searchCustomerBalances: hSearchCustomerBalancesDirect,
