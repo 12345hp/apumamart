@@ -3070,7 +3070,14 @@ async function hGetMySubscription(req, args) {
       }
     }
   }
-  const hasMultiBranch = plan && plan.includes('branch');
+  let hasMultiBranch = !!(plan && plan.includes('branch'));
+  if (!hasMultiBranch) {
+    try {
+      const [us] = await pool.execute(
+        "SELECT id FROM user_subscriptions WHERE user_id = ? AND tier = 'branch' AND expires_at > NOW() LIMIT 1", [user.id]);
+      hasMultiBranch = us.length > 0;
+    } catch (_) {}
+  }
   return { ok: true, is_branch: _isBranch, branch_name: _branchName, isPremium, isTrial, trialDaysLeft, hasMultiBranch: !!hasMultiBranch, plan };
 }
 
@@ -3100,10 +3107,17 @@ async function hScanPaperBill() {
 // Plans mirror the website's Premium screen prices.
 // ---------------------------------------------------------------------------
 const WEB_PLANS = {
-  fc_monthly:     { name: 'Future Calculator - Monthly', amount: 9900,   months: 1,  tier: 'fc' },
-  fc_yearly:      { name: 'Future Calculator - Yearly',  amount: 111100, months: 12, tier: 'fc' },
-  branch_monthly: { name: 'Multi Branch - Monthly',      amount: 69900,  months: 1,  tier: 'branch' },
-  branch_yearly:  { name: 'Multi Branch - Yearly',       amount: 499900, months: 12, tier: 'branch' },
+  fc_monthly:     { name: 'Future Calculator - Monthly', amount: 9900,   months: 1,  tier: 'fc',     currency: 'INR' },
+  fc_yearly:      { name: 'Future Calculator - Yearly',  amount: 111100, months: 12, tier: 'fc',     currency: 'INR' },
+  branch_monthly: { name: 'Multi Branch - Monthly',      amount: 69900,  months: 1,  tier: 'branch', currency: 'INR' },
+  branch_yearly:  { name: 'Multi Branch - Yearly',       amount: 499900, months: 12, tier: 'branch', currency: 'INR' },
+  // UAE catalogue (2026-10-22, India+UAE Phase 3; amounts in fils):
+  // Basic = 1 shop, Multi = up to 5 shops, and a branch ADD-ON that joins
+  // the owner's current plan pro-rata to the SAME expiry date (the owner
+  // never buys a second full plan; one combined renewal).
+  ae_basic_yearly: { name: 'Basic - Yearly (UAE)',        amount: 49900,  months: 12, tier: 'fc',     currency: 'AED' },
+  ae_multi_yearly: { name: 'Multi Branch - Yearly (UAE)', amount: 149900, months: 12, tier: 'branch', currency: 'AED' },
+  ae_branch_addon: { name: 'Extra Branch (UAE)',          amount: 29900,  months: 12, tier: 'branch', currency: 'AED', addon: true },
 };
 
 function razorpayKeys() {
@@ -3150,14 +3164,33 @@ async function hCreateWebSubscriptionOrder(req, args) {
   const planId = String(args.plan_id || '');
   const plan = WEB_PLANS[planId];
   if (!plan) { const e = new Error('invalid plan'); e.status = 400; throw e; }
+  // Country-locked buying (Phase 3): an account buys only its own
+  // country's plans - IN accounts the INR catalogue, AE the AED one.
+  const wantCurrency = (user.country === 'AE') ? 'AED' : 'INR';
+  if (plan.currency !== wantCurrency) {
+    const e = new Error('yeh plan aapke country ke liye nahi hai'); e.status = 400; throw e;
+  }
   const { keyId, keySecret } = razorpayKeys();
   const pool = getPool();
+  // Branch ADD-ON: pro-rata for the time left on the owner's current plan,
+  // ending on the SAME expiry date - never a second full-price plan.
+  let chargeAmount = plan.amount;
+  if (plan.addon) {
+    const [us] = await pool.execute(
+      'SELECT expires_at FROM user_subscriptions WHERE user_id = ? ORDER BY expires_at DESC LIMIT 1', [user.id]);
+    const exp = us.length ? new Date(us[0].expires_at) : null;
+    if (!exp || !(exp.getTime() > Date.now())) {
+      const e = new Error('branch add-on ke liye pehle ek active plan chahiye'); e.status = 400; throw e;
+    }
+    const daysLeft = Math.max(1, Math.ceil((exp.getTime() - Date.now()) / 86400000));
+    chargeAmount = Math.max(100, Math.round(plan.amount * Math.min(365, daysLeft) / 365));
+  }
   const receipt = `amw_${user.id}_${Date.now()}`;
   const r = await razorpayRequest(keyId, keySecret, 'POST', '/v1/orders', {
-    amount: plan.amount,
-    currency: 'INR',
+    amount: chargeAmount,
+    currency: plan.currency,
     receipt,
-    notes: { user_id: String(user.id), plan_id: planId },
+    notes: { user_id: String(user.id), plan_id: planId, currency: plan.currency },
   });
   if (r.status < 200 || r.status >= 300 || !r.body || !r.body.id) {
     const msg = (r.body && r.body.error && r.body.error.description) || 'could not create payment order';
@@ -3168,13 +3201,13 @@ async function hCreateWebSubscriptionOrder(req, args) {
   await pool.execute(
     `INSERT INTO web_subscription_orders (user_id, plan_id, razorpay_order_id, amount, status)
      VALUES (?,?,?,?, 'pending')`,
-    [user.id, planId, r.body.id, plan.amount]
+    [user.id, planId, r.body.id, chargeAmount]
   );
   return {
     ok: true,
     key_id: keyId,
-    amount: plan.amount,
-    currency: 'INR',
+    amount: chargeAmount,
+    currency: plan.currency,
     order_id: r.body.id,
     plan_name: plan.name,
   };
@@ -3198,9 +3231,16 @@ async function applyWebSubscriptionActivation(pool, orderRow, paymentId, planId,
      VALUES (?,?,?, 'verified')`,
     [orderRow.user_id, planId, paymentId]
   );
-  // Track expiry per plan duration.
-  const expires = new Date();
+  // Track expiry per plan duration. ADD-ON exception (Phase 3): the
+  // branch joins the owner's CURRENT plan, so its expiry stays the
+  // existing date - one combined renewal for everything.
+  let expires = new Date();
   expires.setMonth(expires.getMonth() + plan.months);
+  if (plan.addon) {
+    const [us] = await pool.execute(
+      'SELECT expires_at FROM user_subscriptions WHERE user_id = ? ORDER BY expires_at DESC LIMIT 1', [orderRow.user_id]);
+    if (us.length && new Date(us[0].expires_at).getTime() > Date.now()) expires = new Date(us[0].expires_at);
+  }
   await pool.execute(
     `INSERT INTO user_subscriptions (user_id, tier, plan_id, expires_at)
      VALUES (?,?,?,?)
