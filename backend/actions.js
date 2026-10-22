@@ -1236,9 +1236,46 @@ function parseRawBillLines(raw) {
   }
   return items;
 }
+// Offline sync helpers (UAE program item 4, 2026-10-22). Queued writes
+// carry a client-generated client_sync_id; the server stores it and a
+// retry with the same key returns the original record instead of making
+// a duplicate. Exactly-once delivery for offline bills and payments.
+function syncIdOf(args) {
+  const s = args && args.client_sync_id != null ? String(args.client_sync_id).trim() : '';
+  return s ? s.slice(0, 64) : null;
+}
+function savedBillResponse(row) {
+  let items = [];
+  try { items = typeof row.items === 'string' ? JSON.parse(row.items) : (row.items || []); } catch (_) { items = []; }
+  if (!Array.isArray(items)) items = [];
+  const total = Number(row.total) || 0, joma = Number(row.joma) || 0, baki = Number(row.baki) || 0;
+  const billItems = items.map((it, ix) => ({
+    id: ix + 1, bill_id: row.id,
+    item_name: it.item_name || it.name || '', name: it.item_name || it.name || '',
+    quantity: it.quantity != null ? it.quantity : (it.qty != null ? it.qty : 1), qty: it.quantity != null ? it.quantity : (it.qty != null ? it.qty : 1),
+    unit: it.unit || '', unit_price: it.unit_price != null ? it.unit_price : (it.rate || 0), rate: it.unit_price != null ? it.unit_price : (it.rate || 0),
+    amount: it.amount != null ? it.amount : ((it.quantity || it.qty || 1) * (it.unit_price || it.rate || 0)),
+    is_cut: false, position: ix }));
+  return { ok: true, saved: true, deduped: true, id: row.id, bill_id: row.id,
+    bill: { id: row.id, bill_number: row.bill_no, bill_no: row.bill_no, mode: row.mode, items: billItems,
+      subtotal: Number(row.subtotal) || 0, discount: Number(row.discount) || 0, gst_amount: Number(row.gst_amount) || 0, total,
+      paid_so_far: joma, joma, remaining: baki, baki,
+      payment_status: baki <= 0 ? 'paid' : (joma > 0 ? 'partial' : 'due'),
+      payments: [], customer_id: row.customer_id, customer_name: null, mobile: null, branch_id: row.branch_id,
+      created_at: row.created_at ? new Date(row.created_at).toISOString() : new Date().toISOString() } };
+}
+async function findBillBySyncId(pool, userId, syncId) {
+  const [rows] = await pool.execute('SELECT id, bill_no, mode, items, subtotal, discount, gst_amount, total, joma, baki, customer_id, branch_id, created_at FROM bills WHERE user_id = ? AND client_sync_id = ?', [userId, syncId]);
+  return rows.length ? savedBillResponse(rows[0]) : null;
+}
+
 async function hSaveBillDirect(req, args) {
   const { user } = needAuth(await authUser(req));
   const pool = getPool();
+  // Offline idempotency: a retry of an already-saved queued bill returns
+  // the original bill instead of inserting a second one.
+  const syncId = syncIdOf(args);
+  if (syncId) { const dup = await findBillBySyncId(pool, user.id, syncId); if (dup) return dup; }
   // v13 (2026-10-20): the "Write the bill" workspace sends a DIFFERENT
   // contract than the manual-lines workspace: { raw_input, paid_amount,
   // round_total, customer_name, customer_mobile, create_customer,
@@ -1349,9 +1386,9 @@ async function hSaveBillDirect(req, args) {
   }
   try {
     const [result] = await pool.execute(
-      `INSERT INTO bills (user_id, customer_id, bill_no, mode, items, subtotal, discount, gst_amount, total, joma, baki, counter, branch_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [user.id, customer_id, args.bill_no ? String(args.bill_no) : null, mode, JSON.stringify(items), subtotal, discount, gst_amount, total, joma, baki, counter, branch_id]
+      `INSERT INTO bills (user_id, customer_id, bill_no, mode, items, subtotal, discount, gst_amount, total, joma, baki, counter, branch_id, client_sync_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [user.id, customer_id, args.bill_no ? String(args.bill_no) : null, mode, JSON.stringify(items), subtotal, discount, gst_amount, total, joma, baki, counter, branch_id, syncId]
     );
     const id = result.insertId;
     let bill_no = args.bill_no ? String(args.bill_no) : null;
@@ -1377,6 +1414,8 @@ async function hSaveBillDirect(req, args) {
         payments: [], customer_id, customer_name: args.customer_name || null,
         mobile: args.customer_mobile || null, branch_id, created_at: new Date().toISOString() } };
   } catch (e) {
+    // Lost the insert race against our own retry: return the winning bill.
+    if (syncId && e && e.code === 'ER_DUP_ENTRY') { const dup = await findBillBySyncId(pool, user.id, syncId); if (dup) return dup; }
     const err = new Error('bill save failed: ' + (e.message || 'db error'));
     err.status = 500; throw err;
   }
@@ -1398,13 +1437,21 @@ async function hRecordPaymentDirect(req, args) {
   const [b] = await pool.execute('SELECT id, customer_id, total, joma FROM bills WHERE id = ? AND user_id = ?', [billId, user.id]);
   if (!b.length) { const e = new Error('bill not found'); e.status = 404; throw e; }
   const bill = b[0];
+  // Offline idempotency (item 4): the payments row carries the client's
+  // sync key; a retry finds it and changes nothing a second time.
+  const syncId = syncIdOf(args);
+  if (syncId) {
+    const [ex] = await pool.execute('SELECT id, amount FROM payments WHERE user_id = ? AND client_sync_id = ?', [user.id, syncId]);
+    if (ex.length) return { ok: true, recorded: true, deduped: true, bill_id: billId, amount: Number(ex[0].amount) || 0,
+      paid_so_far: Number(bill.joma), remaining: Math.max(0, Number(bill.total) - Number(bill.joma)), settled: Number(bill.joma) >= Number(bill.total), message: 'Payment saved.' };
+  }
   const newJoma = Math.min(Number(bill.total), Number(bill.joma) + amount);
   const applied = newJoma - Number(bill.joma);
   const newBaki = Math.max(0, Number(bill.total) - newJoma);
   await pool.execute('UPDATE bills SET joma = ?, baki = ? WHERE id = ?', [newJoma, newBaki, billId]);
   if (applied > 0) {
-    await pool.execute('INSERT INTO payments (user_id, customer_id, amount, note) VALUES (?, ?, ?, ?)',
-      [user.id, bill.customer_id || null, applied, 'Bill payment']);
+    await pool.execute('INSERT INTO payments (user_id, customer_id, amount, note, client_sync_id) VALUES (?, ?, ?, ?, ?)',
+      [user.id, bill.customer_id || null, applied, 'Bill payment', syncId]);
   }
   return { ok: true, recorded: true, bill_id: billId, amount: applied,
            paid_so_far: newJoma, remaining: newBaki, message: 'Payment saved.' };
@@ -1419,13 +1466,23 @@ async function hRecordCustomerPaymentDirect(req, args) {
   const pool = getPool();
   const [c] = await pool.execute('SELECT id FROM customers WHERE id = ? AND user_id = ?', [customer_id, user.id]);
   if (!c.length) { const e = new Error('customer not found'); e.status = 404; throw e; }
+  // Offline idempotency (item 4): same client_sync_id = same payment, once.
+  const syncId = syncIdOf(args);
+  if (syncId) {
+    const [ex] = await pool.execute('SELECT id FROM payments WHERE user_id = ? AND client_sync_id = ?', [user.id, syncId]);
+    if (ex.length) return { ok: true, recorded: true, deduped: true, id: ex[0].id };
+  }
   try {
     const [result] = await pool.execute(
-      'INSERT INTO payments (user_id, customer_id, amount, note) VALUES (?, ?, ?, ?)',
-      [user.id, customer_id, amount, note]
+      'INSERT INTO payments (user_id, customer_id, amount, note, client_sync_id) VALUES (?, ?, ?, ?, ?)',
+      [user.id, customer_id, amount, note, syncId]
     );
     return { ok: true, recorded: true, id: result.insertId };
   } catch (e) {
+    if (syncId && e && e.code === 'ER_DUP_ENTRY') {
+      const [ex] = await pool.execute('SELECT id FROM payments WHERE user_id = ? AND client_sync_id = ?', [user.id, syncId]);
+      if (ex.length) return { ok: true, recorded: true, deduped: true, id: ex[0].id };
+    }
     const err = new Error('payment save failed: ' + (e.message || 'db error'));
     err.status = 500; throw err;
   }
@@ -1956,9 +2013,79 @@ async function hSetPosUpiStatus(req, args) {
   return { ok: true, saved: true, sale_id: saleId, status };
 }
 
+// REAL offline POS sync (UAE program item 4, 2026-10-22). Was a stub that
+// answered {synced:true, count:0} and saved NOTHING — every offline POS
+// sale vanished. The POS screen queues sales on the device with a unique
+// offline_key per sale and flushes them here when the net returns; the key
+// becomes the bill's client_sync_id ('pos_' + key), so a re-flush of the
+// same sale returns the original bill instead of double-selling. Queue
+// items carry only {product_id, quantity, item_discount_percent} — prices
+// are resolved from the products table, exactly like the POS reads them.
 async function hSyncOfflinePosSale(req, args) {
   const { user } = needAuth(await authUser(req));
-  return { ok: true, synced: true, count: 0 };
+  const pool = getPool();
+  const offlineKey = args.offline_key ? String(args.offline_key).slice(0, 59) : null;
+  const syncId = offlineKey ? ('pos_' + offlineKey).slice(0, 64) : syncIdOf(args);
+  if (syncId) {
+    const [ex] = await pool.execute('SELECT id, bill_no, total FROM bills WHERE user_id = ? AND client_sync_id = ?', [user.id, syncId]);
+    if (ex.length) return { ok: true, synced: true, deduped: true, count: 1, bill_id: ex[0].id, sale_id: ex[0].id, bill_no: ex[0].bill_no, total: Number(ex[0].total) || 0 };
+  }
+  const itemsIn = Array.isArray(args.items) ? args.items.filter((it) => it && typeof it === 'object') : [];
+  if (!itemsIn.length) return { ok: false, error: 'no items' };
+  const ids = [...new Set(itemsIn.map((it) => Number(it.product_id)).filter((n) => Number.isFinite(n) && n > 0))];
+  const priceMap = {};
+  if (ids.length) {
+    const [prods] = await pool.execute('SELECT id, name, price FROM products WHERE user_id = ? AND id IN (' + ids.map(() => '?').join(',') + ')', [user.id, ...ids]);
+    for (const p of prods) priceMap[Number(p.id)] = { name: p.name, price: Number(p.price) || 0 };
+  }
+  const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
+  let subtotal = 0, lineDiscount = 0;
+  const lines = itemsIn.map((it) => {
+    const pid = Number(it.product_id) || null;
+    const prod = pid ? priceMap[pid] : null;
+    const qty = num(it.quantity != null ? it.quantity : it.qty) || 1;
+    const unit_price = it.unit_price != null ? num(it.unit_price) : (prod ? prod.price : 0);
+    const gross = unit_price * qty;
+    const discPct = Math.max(0, Math.min(100, num(it.item_discount_percent)));
+    const disc = gross * discPct / 100;
+    subtotal += gross; lineDiscount += disc;
+    const nm = (prod && prod.name) || it.name || it.product_name || '';
+    return { product_id: pid, name: nm, product_name: nm, quantity: qty, qty,
+      unit_price, price: unit_price, item_discount_percent: discPct,
+      amount: Math.round((gross - disc) * 100) / 100 };
+  });
+  const netLines = subtotal - lineDiscount;
+  const bv = Math.max(0, num(args.bill_discount_value));
+  const bt = String(args.bill_discount_type || '').toLowerCase();
+  const billDisc = (bt === 'percent' || bt === 'percentage' || bt === '%') ? netLines * bv / 100 : bv;
+  const discount = Math.round((lineDiscount + billDisc) * 100) / 100;
+  const total = Math.max(0, Math.round((subtotal - discount) * 100) / 100);
+  const cash = num(args.cash_amount), card = num(args.card_amount), upi = num(args.upi_amount);
+  const paid = cash + card + upi;
+  const joma = Math.min(paid, total);
+  const baki = Math.max(0, Math.round((total - joma) * 100) / 100);
+  const modes = [cash > 0 ? 'cash' : null, card > 0 ? 'card' : null, upi > 0 ? 'upi' : null].filter(Boolean);
+  const payment_mode = modes.length > 1 ? 'mixed' : (modes[0] || 'cash');
+  try {
+    const [result] = await pool.execute(
+      `INSERT INTO bills (user_id, customer_id, bill_no, mode, items, subtotal, discount, gst_amount, total, joma, baki, counter, counter_id, payment_mode, client_sync_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [user.id, null, null, 'modern', JSON.stringify(lines), Math.round(subtotal * 100) / 100, discount, 0, total, joma, baki,
+       args.counter_id != null ? String(args.counter_id) : null, Number.isFinite(Number(args.counter_id)) ? Number(args.counter_id) : null,
+       payment_mode, syncId]
+    );
+    const id = result.insertId;
+    const bill_no = 'B' + id;
+    await pool.execute('UPDATE bills SET bill_no = ? WHERE id = ?', [bill_no, id]);
+    return { ok: true, synced: true, count: 1, bill_id: id, sale_id: id, bill_no, total };
+  } catch (e) {
+    if (syncId && e && e.code === 'ER_DUP_ENTRY') {
+      const [ex] = await pool.execute('SELECT id, bill_no, total FROM bills WHERE user_id = ? AND client_sync_id = ?', [user.id, syncId]);
+      if (ex.length) return { ok: true, synced: true, deduped: true, count: 1, bill_id: ex[0].id, sale_id: ex[0].id, bill_no: ex[0].bill_no, total: Number(ex[0].total) || 0 };
+    }
+    const err = new Error('offline POS sync failed: ' + (e.message || 'db error'));
+    err.status = 500; throw err;
+  }
 }
 
 async function hTogglePosRecurringBill(req, args) {
