@@ -96,7 +96,7 @@ async function authUser(req) {
     `SELECT s.id AS sid, s.user_id, s.is_locked,
             u.id, u.name, u.mobile, u.role, u.business_name, u.business_address, u.business_phone,
             u.upi_id, u.loyalty_rate, u.store_code, u.online_store_enabled, u.shop_hours, u.return_policy,
-            u.app_lock_enabled
+            u.app_lock_enabled, u.country, u.is_test
      FROM sessions s JOIN users u ON u.id = s.user_id
      WHERE s.token_hash = ?`,
     [hashToken(m[1])]
@@ -123,6 +123,7 @@ async function authUser(req) {
       id: s.user_id, name: s.name, mobile: s.mobile, role: s.role,
       business_name: s.business_name, business_address: s.business_address,
       business_phone: s.business_phone, app_lock_enabled: !!s.app_lock_enabled,
+      country: s.country || 'IN', is_test: !!s.is_test,
     },
     locked: !!s.is_locked,
     sessionId: s.sid,
@@ -174,15 +175,41 @@ async function hListUsers(req, args) {
   if (search) {
     const like = `%${search}%`;
     [rows] = await getPool().execute(
-      'SELECT id, name, mobile, role, business_name, created_at FROM users WHERE name LIKE ? OR mobile LIKE ? OR business_name LIKE ? ORDER BY created_at ASC',
+      'SELECT id, name, mobile, role, business_name, country, is_test, created_at FROM users WHERE name LIKE ? OR mobile LIKE ? OR business_name LIKE ? ORDER BY created_at ASC',
       [like, like, like]
     );
   } else {
     [rows] = await getPool().execute(
-      'SELECT id, name, mobile, role, business_name, created_at FROM users ORDER BY created_at ASC'
+      'SELECT id, name, mobile, role, business_name, country, is_test, created_at FROM users ORDER BY created_at ASC'
     );
   }
   return { ok: true, users: rows };
+}
+
+async function hSetTestAccount(req, args) {
+  const { user } = needAuth(await authUser(req));
+  if (user.role !== 'owner' && user.role !== 'admin') {
+    const e = new Error('only owner/admin can set the TEST flag'); e.status = 403; throw e;
+  }
+  const pool = getPool();
+  let target = null;
+  if (args && args.user_id) {
+    const [r] = await pool.execute('SELECT id, mobile FROM users WHERE id = ? LIMIT 1', [parseInt(args.user_id, 10) || 0]);
+    target = r[0] || null;
+  } else if (args && args.mobile) {
+    const d = String(args.mobile).replace(/\D/g, '');
+    const cands = [d];
+    if (d.length === 9 && d.charAt(0) === '5') cands.push('971' + d);
+    if (d.length === 12 && d.indexOf('971') === 0) cands.push(d.slice(3));
+    if (d.length === 10) cands.push('91' + d);
+    const ph = cands.map(() => '?').join(',');
+    const [r] = await pool.execute(`SELECT id, mobile FROM users WHERE mobile IN (${ph}) ORDER BY id ASC LIMIT 1`, cands);
+    target = r[0] || null;
+  }
+  if (!target) { const e = new Error('account not found'); e.status = 404; throw e; }
+  const flag = args && (args.is_test === true || args.is_test === 1 || args.is_test === '1' || args.is_test === 'true') ? 1 : 0;
+  await pool.execute('UPDATE users SET is_test = ? WHERE id = ?', [flag, target.id]);
+  return { ok: true, user_id: target.id, mobile: target.mobile, is_test: flag === 1 };
 }
 
 async function hAdminStats(req) {
@@ -2978,6 +3005,11 @@ async function hGetMySubscription(req, args) {
   if (user.role === 'owner' || user.role === 'admin' || _mob === '9735744904' || _mob === '8373030203') {
     return { ok: true, is_branch: _isBranch, branch_name: _branchName, isPremium: true, isTrial: false, trialDaysLeft: 0, hasMultiBranch: true, plan: 'admin-lifetime' };
   }
+  // TEST accounts (owner-flagged, 2026-10-22): lifetime free in both
+  // countries so testing never hits a paywall or needs a real payment.
+  if (user.is_test) {
+    return { ok: true, is_branch: _isBranch, branch_name: _branchName, isPremium: true, isTrial: false, trialDaysLeft: 0, hasMultiBranch: true, plan: 'test-lifetime' };
+  }
   const pool = getPool();
   // Branch staff (manager-link users): access follows the branch OWNER's
   // plan. Owner premium => manager app stays open; owner locked => locked.
@@ -2985,12 +3017,15 @@ async function hGetMySubscription(req, args) {
     const [br] = await pool.execute(
       'SELECT owner_user_id FROM branches WHERE branch_user_id = ? AND token_active = 1 LIMIT 1', [user.id]);
     if (br.length) {
-      const [ow] = await pool.execute('SELECT role, mobile, created_at FROM users WHERE id = ?', [br[0].owner_user_id]);
+      const [ow] = await pool.execute('SELECT role, mobile, created_at, is_test FROM users WHERE id = ?', [br[0].owner_user_id]);
       const owner = ow[0];
       if (owner) {
         const omob = String(owner.mobile || '').replace(/\D/g, '').slice(-10);
         if (owner.role === 'owner' || owner.role === 'admin' || omob === '9735744904' || omob === '8373030203') {
           return { ok: true, is_branch: _isBranch, branch_name: _branchName, isPremium: true, isTrial: false, trialDaysLeft: 0, hasMultiBranch: true, plan: 'admin-lifetime' };
+        }
+        if (owner.is_test) {
+          return { ok: true, is_branch: _isBranch, branch_name: _branchName, isPremium: true, isTrial: false, trialDaysLeft: 0, hasMultiBranch: true, plan: 'test-lifetime' };
         }
         const [os] = await pool.execute(
           'SELECT status, product_id FROM subscriptions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1', [br[0].owner_user_id]);
@@ -3816,6 +3851,7 @@ const DIRECT = {
   adminResetPassword: hAdminResetPassword,
   listUsers: hListUsers,
   adminUserList: hListUsers,
+  setTestAccount: hSetTestAccount,
   adminStats: hAdminStats,
   adminDashboard: hAdminDashboard,
   adminUserDetail: hAdminUserDetail,
