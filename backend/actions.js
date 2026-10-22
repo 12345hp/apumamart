@@ -551,7 +551,7 @@ async function hListCustomerLedger(req, args) {
 // Customer baki rollup shared by getKhata / getBakiOverview.
 async function customerBakiRows(userId) {
   const [rows] = await getPool().execute(
-    `SELECT c.id AS customer_id, c.name AS customer_name, c.mobile, c.credit_limit,
+    `SELECT c.id AS customer_id, c.name AS customer_name, c.mobile, c.credit_limit, c.trn, c.address,
             c.created_at AS joined_on,
             COALESCE((SELECT SUM(b.total) FROM bills b WHERE b.customer_id = c.id AND b.user_id = c.user_id), 0) AS total_billed,
             COALESCE((SELECT SUM(b.joma) FROM bills b WHERE b.customer_id = c.id AND b.user_id = c.user_id), 0) AS bills_joma,
@@ -594,6 +594,7 @@ async function customerBakiRows(userId) {
       total_baki: due, amount_due: due, total_due: due, baki: due,
       plus_amount: plus, plus: plus,
       credit_limit: r.credit_limit != null ? Number(r.credit_limit) : null,
+      trn: r.trn || null, address: r.address || null,
       aging_bucket: due > 0 ? (daysOverdue <= 30 ? '0-30' : daysOverdue <= 60 ? '31-60' : daysOverdue <= 90 ? '61-90' : '90+') : null,
       days_overdue: daysOverdue,
     };
