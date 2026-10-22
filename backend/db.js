@@ -320,6 +320,19 @@ const SCHEMA = [
   INDEX idx_customer (customer_id),
   INDEX idx_link (razorpay_link_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+`CREATE TABLE IF NOT EXISTS bill_einvoices (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  bill_id INT NOT NULL UNIQUE,
+  customer_id INT NULL,
+  status VARCHAR(20) DEFAULT 'not_sent',
+  record JSON NULL,
+  missing_fields JSON NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_user (user_id),
+  INDEX idx_customer (customer_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 `CREATE TABLE IF NOT EXISTS user_subscriptions (
   user_id INT PRIMARY KEY,
   tier VARCHAR(20) NOT NULL,
@@ -633,6 +646,13 @@ async function initDb() {
       const [cc] = await pool.execute("SELECT COUNT(*) AS c FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'customers' AND COLUMN_NAME = 'credit_limit'");
       if (cc[0].c === 0) await pool.execute('ALTER TABLE customers ADD COLUMN credit_limit DECIMAL(12,2) NULL');
     } catch (e) { console.warn('[db] credit_limit migration skipped:', e.message); }
+    // Migration: customers.trn + customers.address (e-invoice buyer details, UAE program item 3, 2026-10-22)
+    try {
+      const [ct] = await pool.execute("SELECT COUNT(*) AS c FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'customers' AND COLUMN_NAME = 'trn'");
+      if (ct[0].c === 0) await pool.execute('ALTER TABLE customers ADD COLUMN trn VARCHAR(20) NULL');
+      const [ca] = await pool.execute("SELECT COUNT(*) AS c FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'customers' AND COLUMN_NAME = 'address'");
+      if (ca[0].c === 0) await pool.execute('ALTER TABLE customers ADD COLUMN address TEXT NULL');
+    } catch (e) { console.warn('[db] customer tax-details migration skipped:', e.message); }
     // One-time migration: normalize stored mobile numbers (strip leading 0 / 91)
     try {
       await pool.execute("UPDATE users SET mobile = SUBSTRING(mobile, 2) WHERE mobile LIKE '0%' AND LENGTH(mobile) = 11");
