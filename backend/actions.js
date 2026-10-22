@@ -1761,9 +1761,354 @@ async function hClosePosDayDirect(req, args) {
   );
   return { ok: true, closed: true, id: res.insertId, expected_cash: expected, actual_cash: actualCash, date: bdate };
 }
+// ============================================================================
+// AI HISAB — real answers (2026-10-22, AI-agents program idea 1, LAYER 1)
+// Read-only question engine over the shop's OWN data. Every number comes
+// from SQL or the shared khata rollup (customerBakiRows) — the engine only
+// understands the question and phrases the answer. It NEVER writes data.
+// The AI Hisab screen sends { question, language, local_date,
+// timezone_offset_minutes } and reads back { answer, period_label,
+// facts: [{ label, value }] } (verified in the live bundle, 2026-10-22).
+// LAYER 2 (prepared, NOT active): aiHisabLlmAnswer() is where an LLM call
+// would plug in later, behind env AI_HISAB_LLM=on. It stays a stub — no
+// key, no call — the rule engine below answers everything today.
+// ============================================================================
+
+const AI_HISAB_LLM = process.env.AI_HISAB_LLM === 'on';
+
+async function aiHisabLlmAnswer(user, question, lang) {
+  // LAYER 2 STUB — intentionally returns null (no model connected).
+  // When Admin approves an AI key, the model call goes here: give the
+  // model the question plus read-only tool results (rollup / bills /
+  // expenses aggregates) and return { answer, period_label, facts } in
+  // the exact shape the screen reads. Until then the caller falls
+  // through to the rule engine, so answers never depend on this stub.
+  return null;
+}
+
+const AI_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+const AI_T = {
+  en: { today: 'Today', yesterday: 'Yesterday', week: 'Last 7 days', lastWeek: 'Previous 7 days', month: 'This month', lastMonth: 'Last month', tillNow: 'Till now', totalBaki: 'Total baki', bakiCustomers: 'Customers with baki', highestBaki: 'Highest baki', plus: 'Extra paid (plus)', billed: 'Total billed', paid: 'Paid so far', baki: 'Baki', bills: 'Bills', sales: 'Sales', collected: 'Collected', credit: 'On credit (baki)', expenses: 'Expenses', entries: 'Entries', products: 'Products', stockQty: 'Total stock (units)', stockValue: 'Stock value', lowStock: 'Low-stock items', customers: 'Total customers' },
+  hinglish: { today: 'Aaj', yesterday: 'Kal', week: 'Pichle 7 din', lastWeek: 'Usse pichle 7 din', month: 'Is mahine', lastMonth: 'Pichle mahine', tillNow: 'Abhi tak', totalBaki: 'Kul baki', bakiCustomers: 'Baki wale customer', highestBaki: 'Sabse zyada baki', plus: 'Zyada jama (plus)', billed: 'Kul bill', paid: 'Kul jama', baki: 'Baki', bills: 'Bill', sales: 'Bikri', collected: 'Jama hua', credit: 'Udhar gaya', expenses: 'Kharcha', entries: 'Entry', products: 'Product', stockQty: 'Kul stock (unit)', stockValue: 'Stock ki value', lowStock: 'Kam stock wale item', customers: 'Kul customer' },
+  hi: { today: 'आज', yesterday: 'कल', week: 'पिछले 7 दिन', lastWeek: 'उससे पिछले 7 दिन', month: 'इस महीने', lastMonth: 'पिछले महीने', tillNow: 'अभी तक', totalBaki: 'कुल बाकी', bakiCustomers: 'बाकी वाले ग्राहक', highestBaki: 'सबसे ज़्यादा बाकी', plus: 'ज़्यादा जमा (प्लस)', billed: 'कुल बिल', paid: 'कुल जमा', baki: 'बाकी', bills: 'बिल', sales: 'बिक्री', collected: 'जमा हुआ', credit: 'उधार गया', expenses: 'खर्चा', entries: 'एंट्री', products: 'प्रोडक्ट', stockQty: 'कुल स्टॉक (यूनिट)', stockValue: 'स्टॉक की कीमत', lowStock: 'कम स्टॉक वाले आइटम', customers: 'कुल ग्राहक' },
+  bn: { today: 'আজ', yesterday: 'গতকাল', week: 'গত 7 দিন', lastWeek: 'তার আগের 7 দিন', month: 'এই মাসে', lastMonth: 'গত মাসে', tillNow: 'এখন পর্যন্ত', totalBaki: 'মোট বাকি', bakiCustomers: 'বাকি আছে এমন গ্রাহক', highestBaki: 'সবচেয়ে বেশি বাকি', plus: 'বেশি জমা (প্লাস)', billed: 'মোট বিল', paid: 'মোট জমা', baki: 'বাকি', bills: 'বিল', sales: 'বিক্রি', collected: 'জমা হয়েছে', credit: 'বাকিতে গেছে', expenses: 'খরচ', entries: 'এন্ট্রি', products: 'প্রোডাক্ট', stockQty: 'মোট স্টক (ইউনিট)', stockValue: 'স্টকের দাম', lowStock: 'কম স্টকের আইটম', customers: 'মোট গ্রাহক' },
+};
+
+const AI_SORRY = {
+  en: 'Could not answer just now. Please try again.',
+  hinglish: 'Abhi jawab nahi mil paya. Phir koshish karo.',
+  hi: 'अभी जवाब नहीं मिल पाया। फिर कोशिश करें।',
+  bn: 'এখন উত্তর পাওয়া যাচ্ছে না। আবার চেষ্টা করুন।',
+};
+
+function aiMoney(n, cur) {
+  const v = Math.round((Number(n) || 0) * 100) / 100;
+  const s = v.toLocaleString(cur === 'AED' ? 'en-US' : 'en-IN', { minimumFractionDigits: Number.isInteger(v) ? 0 : 2, maximumFractionDigits: 2 });
+  return (cur === 'AED' ? 'AED ' : '₹') + s;
+}
+
+function aiNum(n) {
+  const v = Math.round((Number(n) || 0) * 1000) / 1000;
+  return v.toLocaleString('en-IN', { minimumFractionDigits: 0, maximumFractionDigits: 3 });
+}
+
+function aiLocalParts(msUtc, offMin) {
+  const d = new Date(msUtc - offMin * 60000);
+  return { y: d.getUTCFullYear(), m: d.getUTCMonth(), d: d.getUTCDate() };
+}
+
+function aiFmtDay(msUtc, offMin) {
+  const p = aiLocalParts(msUtc, offMin);
+  return p.d + ' ' + AI_MONTHS[p.m] + ' ' + p.y;
+}
+
+// Window [start, end) in UTC ms for a period, anchored on the CLIENT's
+// local date + timezone offset (exactly what the screen sends), so "aaj"
+// means the shopkeeper's today — same FROM_UNIXTIME pattern the POS day
+// close already uses.
+function aiWindow(period, args) {
+  const rawOff = Number(args && args.timezone_offset_minutes);
+  const off = Number.isFinite(rawOff) && rawOff >= -840 && rawOff <= 720 ? rawOff : -330;
+  let y, m, d;
+  const mm = String((args && args.local_date) || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (mm) { y = +mm[1]; m = +mm[2]; d = +mm[3]; }
+  else { const p = aiLocalParts(Date.now(), off); y = p.y; m = p.m + 1; d = p.d; }
+  const DAY = 86400000;
+  const dayStart = Date.UTC(y, m - 1, d) + off * 60000;
+  switch (period) {
+    case 'yesterday': return { start: dayStart - DAY, end: dayStart, off, dayStart };
+    case 'week': return { start: dayStart - 6 * DAY, end: dayStart + DAY, off, dayStart };
+    case 'lastWeek': return { start: dayStart - 13 * DAY, end: dayStart - 6 * DAY, off, dayStart };
+    case 'month': return { start: Date.UTC(y, m - 1, 1) + off * 60000, end: Date.UTC(y, m, 1) + off * 60000, off, dayStart };
+    case 'lastMonth': return { start: Date.UTC(y, m - 2, 1) + off * 60000, end: Date.UTC(y, m - 1, 1) + off * 60000, off, dayStart };
+    default: return { start: dayStart, end: dayStart + DAY, off, dayStart };
+  }
+}
+
+function aiPeriodLabel(period, win, lang) {
+  const T = AI_T[lang] || AI_T.en;
+  const DAY = 86400000;
+  if (period === 'today' || period === 'yesterday') return T[period] + ' · ' + aiFmtDay(win.start, win.off);
+  if (period === 'week' || period === 'lastWeek') return T[period] + ' · ' + aiFmtDay(win.start, win.off) + ' – ' + aiFmtDay(win.end - DAY, win.off);
+  if (period === 'month' || period === 'lastMonth') { const p = aiLocalParts(win.start, win.off); return T[period] + ' · ' + AI_MONTHS[p.m] + ' ' + p.y; }
+  return T.tillNow + ' · ' + aiFmtDay(win.dayStart, win.off);
+}
+
+function aiDetectLang(question, uiLang) {
+  const q = String(question || '');
+  if (/[\u0980-\u09FF]/.test(q)) return 'bn';
+  if (/[\u0900-\u097F]/.test(q)) return 'hi';
+  const toks = q.toLowerCase().split(/[^a-z]+/).filter(Boolean);
+  if (toks.includes('koto') || toks.includes('kato')) return 'bn';
+  const HINDI = ['baki', 'kitna', 'kitni', 'kiska', 'kisne', 'kharcha', 'kharch', 'bikri', 'jama', 'udhaar', 'udhar', 'mahine', 'mahina', 'hafte', 'hafta', 'sabse', 'zyada', 'aaj', 'kal', 'dukaan', 'dukan', 'hisab', 'hua', 'mera', 'meri', 'mere', 'kitne', 'kisko', 'grahak'];
+  const ENG = ['what', 'is', 'my', 'the', 'how', 'much', 'many', 'who', 'total', 'sales', 'sale', 'today', 'yesterday', 'expenses', 'expense', 'stock', 'customers', 'customer', 'income', 'earned', 'earn', 'owes', 'owe', 'paid', 'most', 'this', 'month', 'week', 'last'];
+  const hiHits = toks.filter((t) => HINDI.includes(t)).length;
+  const enHits = toks.filter((t) => ENG.includes(t)).length;
+  if (enHits > hiHits && enHits >= 2) return 'en';
+  if (hiHits > 0) return 'hinglish';
+  if (uiLang === 'bn') return 'bn';
+  if (uiLang === 'hi') return 'hi';
+  return 'en';
+}
+
+function aiDetectPeriod(q) {
+  const hasMonth = /mahin|महीन|मास|month|মাস/.test(q);
+  const hasWeek = /haft|हफ़्त|हफ्त|week|সপ্তাহ/.test(q);
+  if (/pichl|पिछल|last|গত/.test(q) && hasMonth) return 'lastMonth';
+  if (hasMonth) return 'month';
+  if (/pichl|पिछल|last|গত/.test(q) && hasWeek) return 'lastWeek';
+  if (hasWeek) return 'week';
+  if (/kal|कल|yesterday|গতকাল/.test(q)) return 'yesterday';
+  return 'today';
+}
+
+// Find the customer a question is about. Returns { row } on a clear
+// match, { ambiguous: [names] } when two customers tie, or null.
+function aiMatchCustomer(q, rows) {
+  const digits = q.replace(/\D/g, '');
+  let best = [], bestScore = 0;
+  for (const r of rows) {
+    const name = String(r.customer_name || '').toLowerCase().trim();
+    if (!name) continue;
+    let score = 0;
+    if (name.length >= 3 && q.includes(name)) score = 100 + name.length;
+    else {
+      for (const tok of name.split(/\s+/)) {
+        if (tok.length >= 4 && q.includes(tok)) score = Math.max(score, 40 + tok.length);
+        else if (tok.length === 3 && new RegExp('\\b' + tok + '\\b').test(q)) score = Math.max(score, 30);
+      }
+    }
+    if (digits.length >= 7 && r.mobile) {
+      const md = String(r.mobile).replace(/\D/g, '');
+      if (md && md.endsWith(digits.slice(-10))) score = Math.max(score, 90);
+    }
+    if (score > bestScore) { bestScore = score; best = [r]; }
+    else if (score === bestScore && score > 0) best.push(r);
+  }
+  if (!bestScore) return null;
+  if (best.length > 1) return { ambiguous: best.map((r) => r.customer_name) };
+  return { row: best[0] };
+}
+
+function aiFallbackAnswer(lang) {
+  const T = AI_T[lang] || AI_T.en;
+  const answer = {
+    en: 'I answer from your own shop data. You can ask me: "Total baki kitna hai?", "Sabse zyada baki kiska hai?", "Aaj ki sale kitni?", "Is mahine ka kharcha kitna?", "<customer name> ka baki kitna hai?", "Kisne sabse zyada jama kiya?", "Stock kitna hai?" or "Total customers kitne hain?"',
+    hinglish: 'Main aapki dukaan ke data se jawab deta hoon. Aap pooch sakte hain: "Total baki kitna hai?", "Sabse zyada baki kiska hai?", "Aaj ki sale kitni?", "Is mahine ka kharcha kitna?", "<customer ka naam> ka baki kitna hai?", "Kisne sabse zyada jama kiya?", "Stock kitna hai?" ya "Total customers kitne hain?"',
+    hi: 'मैं आपकी दुकान के data से जवाब देता हूँ। आप पूछ सकते हैं: "कुल बाकी कितना है?", "सबसे ज़्यादा बाकी किसका है?", "आज की बिक्री कितनी?", "इस महीने का खर्चा कितना?", "<ग्राहक का नाम> का बाकी कितना है?", "किसने सबसे ज़्यादा जमा किया?", "स्टॉक कितना है?" या "कुल ग्राहक कितने हैं?"',
+    bn: 'আমি আপনার দোকানের data থেকে উত্তর দিই। আপনি জিজ্ঞাসা করতে পারেন: "মোট বাকি কত?", "সবচেয়ে বেশি বাকি কার?", "আজকের বিক্রি কত?", "এই মাসের খরচ কত?", "<গ্রাহকের নাম>-এর বাকি কত?", "কে সবচেয়ে বেশি জমা দিয়েছে?", "স্টক কত আছে?" বা "মোট গ্রাহক কতজন?"',
+  }[lang];
+  return { ok: true, answer: answer || 'I answer from your own shop data. Ask me about baki, sales, expenses, a customer, or stock.', period_label: '', facts: [] };
+}
+
+async function aiRuleAnswer(user, question, lang, cur, args) {
+  const pool = getPool();
+  const T = AI_T[lang] || AI_T.en;
+  const q = ' ' + question.toLowerCase() + ' ';
+  const period = aiDetectPeriod(q);
+  const win = aiWindow(period, args);
+  const tillLabel = T.tillNow + ' · ' + aiFmtDay(win.dayStart, win.off);
+  const S = (obj) => obj[lang] || obj.en;
+
+  const isStock = /stock|स्टॉक|স্টক|godown/.test(q);
+  const isCustCount = /(kitne|kitni|কত|how many|total).{0,20}(customer|grahak|ग्राहक|গ্রাহক)|customer.{0,10}(kitne|count|total)/.test(q);
+  const isExpense = /kharch|expense|खर्च|খরচ/.test(q);
+  const isTopPaid = /(sabse zyada|sabse jyada|सबसे ज़्यादा|সবচেয়ে বেশি|most|highest).{0,30}(jama|paid|diya|payment|जमा|দিয়েছে)|(kisne|who|কে).{0,30}(jama|paid|diya|जमा)/.test(q);
+  const isTopBaki = /(sabse zyada|sabse jyada|सबसे ज़्यादा|সবচেয়ে বেশি|most|highest|zyada).{0,30}(baki|due|udhaar|बाकी|বাকি|owe)|(kiska|किसका|কার|who).{0,20}(baki|बाकी|বাকি|owe)/.test(q);
+  const isBaki = /baki|बाकी|বাকি|due|udhaar|उधार|owe|lena hai/.test(q);
+  const isSale = /sale|bikri|बिक्री|বিক্রি|income|aay|आय|আয়|kama|earn|sell|business/.test(q);
+
+  if (isStock) {
+    const [rows] = await pool.execute(
+      `SELECT COUNT(*) AS items, COALESCE(SUM(stock),0) AS qty, COALESCE(SUM(stock * price),0) AS val,
+              COALESCE(SUM(CASE WHEN low_stock_at > 0 AND stock <= low_stock_at THEN 1 ELSE 0 END),0) AS low
+       FROM products WHERE user_id = ?`, [user.id]);
+    const r = rows[0] || {};
+    const items = Number(r.items) || 0;
+    const facts = [
+      { label: T.products, value: String(items) },
+      { label: T.stockQty, value: aiNum(r.qty) },
+      { label: T.stockValue, value: aiMoney(r.val, cur) },
+    ];
+    if (Number(r.low) > 0) facts.push({ label: T.lowStock, value: String(Number(r.low)) });
+    const answer = items === 0
+      ? S({ en: 'No products are added yet, so there is no stock to show.', hinglish: 'Abhi koi product add nahi hai, isliye stock dikhane ko nahi hai.', hi: 'अभी कोई प्रोडक्ट add नहीं है, इसलिए स्टॉक दिखाने को नहीं है।', bn: 'এখনও কোনো প্রোডাক্ট add করা হয়নি, তাই স্টক দেখানোর মতো নেই।' })
+      : S({ en: `You have ${items} products. Total stock is ${aiNum(r.qty)} units, worth about ${aiMoney(r.val, cur)}.`, hinglish: `Aapke paas ${items} product hain. Kul stock ${aiNum(r.qty)} unit hai, value lagbhag ${aiMoney(r.val, cur)}.`, hi: `आपके पास ${items} प्रोडक्ट हैं। कुल स्टॉक ${aiNum(r.qty)} यूनिट है, कीमत लगभग ${aiMoney(r.val, cur)}।`, bn: `আপনার কাছে ${items}টি প্রোডাক্ট আছে। মোট স্টক ${aiNum(r.qty)} ইউনিট, দাম প্রায় ${aiMoney(r.val, cur)}।` });
+    return { ok: true, answer, period_label: tillLabel, facts };
+  }
+
+  if (isExpense) {
+    const [rows] = await pool.execute(
+      `SELECT COUNT(*) AS cnt, COALESCE(SUM(amount),0) AS total FROM expenses
+       WHERE user_id = ? AND created_at >= FROM_UNIXTIME(?) AND created_at < FROM_UNIXTIME(?)`,
+      [user.id, Math.floor(win.start / 1000), Math.floor(win.end / 1000)]);
+    const r = rows[0] || {};
+    const total = Number(r.total) || 0, cnt = Number(r.cnt) || 0;
+    const P = T[period];
+    const facts = [{ label: T.expenses, value: aiMoney(total, cur) }, { label: T.entries, value: String(cnt) }];
+    const answer = cnt === 0
+      ? S({ en: `${P} no expense entry is recorded. Total expense is ${aiMoney(0, cur)}.`, hinglish: `${P} koi kharcha entry nahi mili. Kul kharcha ${aiMoney(0, cur)} hai.`, hi: `${P} कोई खर्चा एंट्री नहीं मिली। कुल खर्चा ${aiMoney(0, cur)} है।`, bn: `${P} কোনো খরচের এন্ট্রি পাওয়া যায়নি। মোট খরচ ${aiMoney(0, cur)}।` })
+      : S({ en: `${P} your expenses are ${aiMoney(total, cur)} (${cnt} entries).`, hinglish: `${P} aapka kul kharcha ${aiMoney(total, cur)} hai (${cnt} entry).`, hi: `${P} आपका कुल खर्चा ${aiMoney(total, cur)} है (${cnt} एंट्री)।`, bn: `${P} আপনার মোট খরচ ${aiMoney(total, cur)} (${cnt}টি এন্ট্রি)।` });
+    return { ok: true, answer, period_label: aiPeriodLabel(period, win, lang), facts };
+  }
+
+  if (isSale && !isBaki && !isTopBaki && !isTopPaid) {
+    const [rows] = await pool.execute(
+      `SELECT COUNT(*) AS cnt, COALESCE(SUM(total),0) AS sales, COALESCE(SUM(joma),0) AS collected, COALESCE(SUM(baki),0) AS credit_given
+       FROM bills WHERE user_id = ? AND created_at >= FROM_UNIXTIME(?) AND created_at < FROM_UNIXTIME(?)`,
+      [user.id, Math.floor(win.start / 1000), Math.floor(win.end / 1000)]);
+    const r = rows[0] || {};
+    const P = T[period];
+    const facts = [
+      { label: T.sales, value: aiMoney(r.sales, cur) },
+      { label: T.bills, value: String(Number(r.cnt) || 0) },
+      { label: T.collected, value: aiMoney(r.collected, cur) },
+      { label: T.credit, value: aiMoney(r.credit_given, cur) },
+    ];
+    const answer = S({
+      en: `${P} your sales are ${aiMoney(r.sales, cur)} from ${Number(r.cnt) || 0} bills. Collected ${aiMoney(r.collected, cur)}, and ${aiMoney(r.credit_given, cur)} went on credit.`,
+      hinglish: `${P} aapki bikri ${aiMoney(r.sales, cur)} hui (${Number(r.cnt) || 0} bill). Jama ${aiMoney(r.collected, cur)} hua, aur ${aiMoney(r.credit_given, cur)} udhaar gaya.`,
+      hi: `${P} आपकी बिक्री ${aiMoney(r.sales, cur)} हुई (${Number(r.cnt) || 0} बिल)। जमा ${aiMoney(r.collected, cur)} हुआ, और ${aiMoney(r.credit_given, cur)} उधार गया।`,
+      bn: `${P} আপনার বিক্রি ${aiMoney(r.sales, cur)} হয়েছে (${Number(r.cnt) || 0}টি বিল)। জমা হয়েছে ${aiMoney(r.collected, cur)}, আর বাকিতে গেছে ${aiMoney(r.credit_given, cur)}।`,
+    });
+    return { ok: true, answer, period_label: aiPeriodLabel(period, win, lang), facts };
+  }
+
+  // Everything below reads the shared khata rollup — the same numbers the
+  // Customers / Baki check / Total Baki screens show.
+  const rows = await customerBakiRows(user.id);
+  const withBaki = rows.filter((r) => r.total_baki > 0).sort((a, b) => b.total_baki - a.total_baki);
+  const totalBaki = rows.reduce((s, r) => s + Math.max(0, r.total_baki), 0);
+  const totalPlus = rows.reduce((s, r) => s + (r.plus_amount || 0), 0);
+  const plusCount = rows.filter((r) => (r.plus_amount || 0) > 0).length;
+
+  if (isCustCount) {
+    const facts = [
+      { label: T.customers, value: String(rows.length) },
+      { label: T.bakiCustomers, value: String(withBaki.length) },
+    ];
+    if (totalPlus > 0) facts.push({ label: T.plus, value: aiMoney(totalPlus, cur) });
+    const answer = S({
+      en: `You have ${rows.length} customers in total. ${withBaki.length} of them have baki right now.`,
+      hinglish: `Aapke kul ${rows.length} customer hain. Unme se ${withBaki.length} ke paas abhi baki hai.`,
+      hi: `आपके कुल ${rows.length} ग्राहक हैं। उनमें से ${withBaki.length} के पास अभी बाकी है।`,
+      bn: `আপনার মোট ${rows.length} জন গ্রাহক আছেন। তাদের মধ্যে ${withBaki.length} জনের কাছে এখন বাকি আছে।`,
+    });
+    return { ok: true, answer, period_label: tillLabel, facts };
+  }
+
+  if (isTopPaid) {
+    const paidRows = rows.filter((r) => r.paid_so_far > 0).sort((a, b) => b.paid_so_far - a.paid_so_far);
+    if (!paidRows.length) {
+      return { ok: true, answer: S({ en: 'No payment is recorded yet.', hinglish: 'Abhi tak koi jama (payment) record nahi hai.', hi: 'अभी तक कोई जमा (पेमेंट) रिकॉर्ड नहीं है।', bn: 'এখনও কোনো জমা (পেমেন্ট) রেকর্ড নেই।' }), period_label: tillLabel, facts: [{ label: T.paid, value: aiMoney(0, cur) }] };
+    }
+    const top = paidRows[0];
+    const facts = paidRows.slice(0, 3).map((r) => ({ label: r.customer_name, value: aiMoney(r.paid_so_far, cur) }));
+    const answer = S({
+      en: `${top.customer_name} has paid the most so far: ${aiMoney(top.paid_so_far, cur)}.`,
+      hinglish: `Sabse zyada jama ${top.customer_name} ne kiya hai: kul ${aiMoney(top.paid_so_far, cur)}.`,
+      hi: `सबसे ज़्यादा जमा ${top.customer_name} ने किया है: कुल ${aiMoney(top.paid_so_far, cur)}।`,
+      bn: `সবচেয়ে বেশি জমা দিয়েছেন ${top.customer_name}: মোট ${aiMoney(top.paid_so_far, cur)}।`,
+    });
+    return { ok: true, answer, period_label: tillLabel, facts };
+  }
+
+  if (isTopBaki) {
+    if (!withBaki.length) {
+      return { ok: true, answer: S({ en: `No customer has any baki right now. Total baki is ${aiMoney(0, cur)}.`, hinglish: `Abhi kisi customer ke paas baki nahi hai. Kul baki ${aiMoney(0, cur)} hai.`, hi: `अभी किसी ग्राहक के पास बाकी नहीं है। कुल बाकी ${aiMoney(0, cur)} है।`, bn: `এখন কোনো গ্রাহকের কাছে বাকি নেই। মোট বাকি ${aiMoney(0, cur)}।` }), period_label: tillLabel, facts: [{ label: T.totalBaki, value: aiMoney(0, cur) }] };
+    }
+    const top = withBaki[0];
+    const facts = withBaki.slice(0, 3).map((r) => ({ label: r.customer_name, value: aiMoney(r.total_baki, cur) }));
+    facts.push({ label: T.totalBaki, value: aiMoney(totalBaki, cur) });
+    const answer = S({
+      en: `${top.customer_name} owes the most: ${aiMoney(top.total_baki, cur)} baki.`,
+      hinglish: `Sabse zyada baki ${top.customer_name} ke paas hai: ${aiMoney(top.total_baki, cur)}.`,
+      hi: `सबसे ज़्यादा बाकी ${top.customer_name} के पास है: ${aiMoney(top.total_baki, cur)}।`,
+      bn: `সবচেয়ে বেশি বাকি ${top.customer_name}-এর কাছে: ${aiMoney(top.total_baki, cur)}।`,
+    });
+    return { ok: true, answer, period_label: tillLabel, facts };
+  }
+
+  // Named-customer question (before the generic baki answer).
+  const match = aiMatchCustomer(q, rows);
+  if (match && match.ambiguous) {
+    const names = match.ambiguous.join(', ');
+    return { ok: true, answer: S({ en: `More than one customer matches that name: ${names}. Please ask with the full name.`, hinglish: `Is naam se ek se zyada customer mile: ${names}. Poora naam likh kar poochho.`, hi: `इस नाम से एक से ज़्यादा ग्राहक मिले: ${names}। पूरा नाम लिखकर पूछें।`, bn: `এই নামে একাধিক গ্রাহক পাওয়া গেছে: ${names}। পুরো নাম লিখে জিজ্ঞাসা করুন।` }), period_label: tillLabel, facts: [] };
+  }
+  if (match && match.row) {
+    const r = match.row;
+    const facts = [
+      { label: T.billed, value: aiMoney(r.total_billed, cur) },
+      { label: T.paid, value: aiMoney(r.paid_so_far, cur) },
+      { label: T.baki, value: aiMoney(r.total_baki, cur) },
+    ];
+    if ((r.plus_amount || 0) > 0) facts.push({ label: T.plus, value: aiMoney(r.plus_amount, cur) });
+    facts.push({ label: T.bills, value: String(r.bills_count) });
+    const paidFocus = /jama|paid|diya|जमा|দিয়েছে/.test(q);
+    const answer = paidFocus
+      ? S({ en: `${r.customer_name} has paid ${aiMoney(r.paid_so_far, cur)} in total. Baki left: ${aiMoney(r.total_baki, cur)}.`, hinglish: `${r.customer_name} ne kul ${aiMoney(r.paid_so_far, cur)} jama kiya hai. Baki abhi ${aiMoney(r.total_baki, cur)} hai.`, hi: `${r.customer_name} ने कुल ${aiMoney(r.paid_so_far, cur)} जमा किया है। बाकी अभी ${aiMoney(r.total_baki, cur)} है।`, bn: `${r.customer_name} মোট ${aiMoney(r.paid_so_far, cur)} জমা দিয়েছেন। বাকি এখন ${aiMoney(r.total_baki, cur)}।` })
+      : S({ en: `${r.customer_name} — total billed ${aiMoney(r.total_billed, cur)}, paid ${aiMoney(r.paid_so_far, cur)}, baki ${aiMoney(r.total_baki, cur)} (${r.bills_count} bills).`, hinglish: `${r.customer_name} ka hisab — kul bill ${aiMoney(r.total_billed, cur)}, jama ${aiMoney(r.paid_so_far, cur)}, baki ${aiMoney(r.total_baki, cur)} (${r.bills_count} bill).`, hi: `${r.customer_name} का हिसाब — कुल बिल ${aiMoney(r.total_billed, cur)}, जमा ${aiMoney(r.paid_so_far, cur)}, बाकी ${aiMoney(r.total_baki, cur)} (${r.bills_count} बिल)।`, bn: `${r.customer_name}-এর হিসাব — মোট বিল ${aiMoney(r.total_billed, cur)}, জমা ${aiMoney(r.paid_so_far, cur)}, বাকি ${aiMoney(r.total_baki, cur)} (${r.bills_count}টি বিল)।` });
+    return { ok: true, answer, period_label: tillLabel, facts };
+  }
+
+  if (isBaki) {
+    const facts = [
+      { label: T.totalBaki, value: aiMoney(totalBaki, cur) },
+      { label: T.bakiCustomers, value: String(withBaki.length) },
+    ];
+    if (withBaki.length) facts.push({ label: T.highestBaki, value: withBaki[0].customer_name + ' · ' + aiMoney(withBaki[0].total_baki, cur) });
+    if (totalPlus > 0) facts.push({ label: T.plus, value: aiMoney(totalPlus, cur) });
+    let answer = totalBaki > 0
+      ? S({ en: `Your total baki is ${aiMoney(totalBaki, cur)} — ${withBaki.length} customer(s) have baki.`, hinglish: `Aapka kul baki ${aiMoney(totalBaki, cur)} hai — ${withBaki.length} customer ke paas baki hai.`, hi: `आपका कुल बाकी ${aiMoney(totalBaki, cur)} है — ${withBaki.length} ग्राहकों के पास बाकी है।`, bn: `আপনার মোট বাকি ${aiMoney(totalBaki, cur)} — ${withBaki.length} জন গ্রাহকের কাছে বাকি আছে।` })
+      : S({ en: `No customer has any baki right now. Total baki is ${aiMoney(0, cur)}.`, hinglish: `Abhi kisi customer ke paas baki nahi hai. Kul baki ${aiMoney(0, cur)} hai.`, hi: `अभी किसी ग्राहक के पास बाकी नहीं है। कुल बाकी ${aiMoney(0, cur)} है।`, bn: `এখন কোনো গ্রাহকের কাছে বাকি নেই। মোট বাকি ${aiMoney(0, cur)}।` });
+    if (totalPlus > 0) {
+      answer += ' ' + S({ en: `${plusCount} customer(s) also paid extra (plus ${aiMoney(totalPlus, cur)}).`, hinglish: `${plusCount} customer ne zyada jama kiya hai (plus ${aiMoney(totalPlus, cur)}).`, hi: `${plusCount} ग्राहक ने ज़्यादा जमा किया है (प्लस ${aiMoney(totalPlus, cur)})।`, bn: `${plusCount} জন গ্রাহক বেশি জমা দিয়েছেন (প্লাস ${aiMoney(totalPlus, cur)})।` });
+    }
+    return { ok: true, answer, period_label: tillLabel, facts };
+  }
+
+  return aiFallbackAnswer(lang);
+}
+
 async function hAskBusinessQuestionDirect(req, args) {
   const { user } = needAuth(await authUser(req));
-  return { ok: true, answer: null };
+  const question = String((args && args.question) || '').trim().slice(0, 240);
+  const cur = user.country === 'AE' ? 'AED' : 'INR';
+  const lang = aiDetectLang(question, args && args.language);
+  try {
+    if (AI_HISAB_LLM) {
+      // Layer 2 hook (prepared, inactive): if an LLM is ever connected
+      // and returns a shaped answer, it wins; otherwise fall through to
+      // the rule engine. Today the stub always returns null.
+      const llm = await aiHisabLlmAnswer(user, question, lang);
+      if (llm && llm.answer) return { ok: true, answer: String(llm.answer), period_label: String(llm.period_label || ''), facts: Array.isArray(llm.facts) ? llm.facts : [] };
+    }
+    if (question.length < 2) return aiFallbackAnswer(lang);
+    return await aiRuleAnswer(user, question, lang, cur, args || {});
+  } catch (_) {
+    return { ok: true, answer: AI_SORRY[lang] || AI_SORRY.en, period_label: '', facts: [] };
+  }
 }
 async function hConfigureAppLockDirect(req, args) {
   const { user } = needAuth(await authUser(req));
