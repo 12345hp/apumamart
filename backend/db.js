@@ -301,6 +301,25 @@ const SCHEMA = [
   INDEX idx_user (user_id),
   INDEX idx_order (razorpay_order_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+`CREATE TABLE IF NOT EXISTS bill_payment_links (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  customer_id INT NOT NULL,
+  bill_id INT NULL,
+  razorpay_link_id VARCHAR(100) UNIQUE NOT NULL,
+  reference_id VARCHAR(64) UNIQUE NOT NULL,
+  short_url VARCHAR(500) NULL,
+  amount INT NOT NULL,
+  currency VARCHAR(3) NOT NULL,
+  status VARCHAR(20) DEFAULT 'created',
+  razorpay_payment_id VARCHAR(100) NULL,
+  payment_row_id INT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  paid_at DATETIME NULL,
+  INDEX idx_user (user_id),
+  INDEX idx_customer (customer_id),
+  INDEX idx_link (razorpay_link_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 `CREATE TABLE IF NOT EXISTS user_subscriptions (
   user_id INT PRIMARY KEY,
   tier VARCHAR(20) NOT NULL,
