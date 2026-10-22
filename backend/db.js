@@ -609,6 +609,11 @@ async function initDb() {
       if (!cols.length) await pool.execute("ALTER TABLE branches ADD COLUMN branch_user_id INT NULL");
     } catch (_) {}
     await ensureBillColumns(pool);
+    // Migration: customers.credit_limit (credit-limit block, UAE program item 1, 2026-10-22)
+    try {
+      const [cc] = await pool.execute("SELECT COUNT(*) AS c FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'customers' AND COLUMN_NAME = 'credit_limit'");
+      if (cc[0].c === 0) await pool.execute('ALTER TABLE customers ADD COLUMN credit_limit DECIMAL(12,2) NULL');
+    } catch (e) { console.warn('[db] credit_limit migration skipped:', e.message); }
     // One-time migration: normalize stored mobile numbers (strip leading 0 / 91)
     try {
       await pool.execute("UPDATE users SET mobile = SUBSTRING(mobile, 2) WHERE mobile LIKE '0%' AND LENGTH(mobile) = 11");
