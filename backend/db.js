@@ -558,6 +558,10 @@ async function ensureBillColumns(pool) {
     // country drives currency + tax label + plan catalogue. Existing
     // users default to IN; nothing about their data changes.
     ['country', "VARCHAR(2) NOT NULL DEFAULT 'IN'"],
+    // TEST flag (2026-10-22, Admin's order): owner can mark any account
+    // TEST -> lifetime premium free in both countries, so test accounts
+    // never hit a paywall during testing.
+    ['is_test', 'TINYINT(1) NOT NULL DEFAULT 0'],
   ];
   for (const [col, def] of userCols) {
     const [rows] = await pool.execute(
