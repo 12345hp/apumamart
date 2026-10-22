@@ -290,6 +290,19 @@ app.post('/api/auth/signup', async (req, res) => {
     const sa = String(b.security_answer || b.securityAnswer || '');
     const biz = String(b.business_name || b.businessName || '').slice(0, 150) || null;
     if (!mob) return res.status(400).json({ ok: false, error: 'mobile is required' });
+    // Country-select rule (Admin, 2026-10-22): the country picked FIRST at
+    // signup must match the mobile number's country, and the number must
+    // be a real India (10-digit) or UAE (9-digit) mobile. Anything else is
+    // refused before anything is created - no silent wrong-country
+    // accounts, no junk-number accounts.
+    const pickedCountry = String(b.country || '').toUpperCase();
+    const intlParsed = parseIntlMobile(b.mobile);
+    if (!intlParsed) {
+      return res.status(400).json({ ok: false, error: 'Sahi mobile number dalo - India ka 10 digit ya UAE ka 9 digit number' });
+    }
+    if ((pickedCountry === 'AE' || pickedCountry === 'IN') && intlParsed.country !== pickedCountry) {
+      return res.status(400).json({ ok: false, error: 'Country aur mobile ka desh match nahi ho raha - sahi country chuno, ya usi desh ka mobile number dalo' });
+    }
     if (!password || password.length < 4) return res.status(400).json({ ok: false, error: 'password must be at least 4 characters' });
     if (!sq || !sa) return res.status(400).json({ ok: false, error: 'security question and answer are required' });
     const pool = getPool();
