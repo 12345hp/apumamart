@@ -554,6 +554,10 @@ async function ensureBillColumns(pool) {
     // guarded googleAuth action. Nullable; normal mobile users never touch them.
     ['email', 'VARCHAR(190) NULL'],
     ['google_sub', 'VARCHAR(255) NULL'],
+    // Country foundation (2026-10-22, India+UAE Phase 1): the account's
+    // country drives currency + tax label + plan catalogue. Existing
+    // users default to IN; nothing about their data changes.
+    ['country', "VARCHAR(2) NOT NULL DEFAULT 'IN'"],
   ];
   for (const [col, def] of userCols) {
     const [rows] = await pool.execute(
